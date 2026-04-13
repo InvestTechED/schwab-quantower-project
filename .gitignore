@@ -1,0 +1,26 @@
+# Secrets
+.env
+**/.env
+**/tokens/*.json
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/*.egg-info/
+
+# Node
+**/node_modules/
+
+# .NET / Visual Studio
+**/bin/
+**/obj/
+**/.vs/
+**/*.user
+**/*.suo
+
+# Logs / temp
+**/logs/
+*.log
+
