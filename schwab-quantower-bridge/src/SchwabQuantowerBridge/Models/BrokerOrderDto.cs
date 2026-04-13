@@ -32,8 +32,20 @@ public sealed class BrokerOrderDto
     [JsonPropertyName("entered_time")]
     public DateTimeOffset? EnteredTime { get; set; }
 
+    [JsonPropertyName("close_time")]
+    public DateTimeOffset? CloseTime { get; set; }
+
     [JsonPropertyName("quantity")]
     public double? Quantity { get; set; }
+
+    [JsonPropertyName("filled_quantity")]
+    public double? FilledQuantity { get; set; }
+
+    [JsonPropertyName("remaining_quantity")]
+    public double? RemainingQuantity { get; set; }
+
+    [JsonPropertyName("average_fill_price")]
+    public double? AverageFillPrice { get; set; }
 
     [JsonPropertyName("price")]
     public double? Price { get; set; }

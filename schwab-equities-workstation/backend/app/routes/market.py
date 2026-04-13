@@ -29,7 +29,7 @@ def market_symbol(symbol: str):
 
 
 @router.get("/market/search")
-def market_search(q: str, limit: int = 10):
+def market_search(q: str, limit: int = 50):
     return market_data_service.search_symbols(q, limit=limit)
 
 

@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from fastapi import APIRouter, HTTPException
 
 from app.models import EquityOrderRequest, ModifyEquityOrderRequest
@@ -19,8 +21,29 @@ def broker_positions():
 
 
 @router.get("/broker/orders")
-def broker_orders(lookback_days: int = 7):
-    return broker_service.get_orders(lookback_days=lookback_days)
+def broker_orders(
+    lookback_days: int = 7,
+    from_entered_datetime: datetime | None = None,
+    to_entered_datetime: datetime | None = None,
+):
+    return broker_service.get_orders(
+        lookback_days=lookback_days,
+        from_entered_datetime=from_entered_datetime,
+        to_entered_datetime=to_entered_datetime,
+    )
+
+
+@router.get("/broker/executions")
+def broker_executions(
+    lookback_days: int = 7,
+    from_entered_datetime: datetime | None = None,
+    to_entered_datetime: datetime | None = None,
+):
+    return broker_service.get_executions(
+        lookback_days=lookback_days,
+        from_entered_datetime=from_entered_datetime,
+        to_entered_datetime=to_entered_datetime,
+    )
 
 
 @router.post("/broker/orders/preview")

@@ -232,11 +232,15 @@ class SchwabStreamingService:
             await self._publish(normalize_symbol(symbol), {"type": "bar", "symbol": symbol, "payload": item})
 
     async def _handle_book(self, message: dict[str, Any]) -> None:
+        venue = message.get("service")
         for item in message.get("content", []):
             symbol = item.get("SYMBOL") or item.get("key")
             if not symbol:
                 continue
-            await self._publish(normalize_symbol(symbol), {"type": "book", "symbol": symbol, "payload": item})
+            await self._publish(
+                normalize_symbol(symbol),
+                {"type": "book", "symbol": symbol, "venue": venue, "payload": item},
+            )
 
     async def _publish(self, symbol: str, event: dict[str, Any]) -> None:
         actual = normalize_symbol(symbol)

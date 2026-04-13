@@ -139,6 +139,44 @@ public sealed class SchwabBackendClient
         return orders ?? [];
     }
 
+    public async Task<IReadOnlyList<BrokerOrderDto>> GetOrdersAsync(
+        DateTime? fromEnteredDateTime,
+        DateTime? toEnteredDateTime,
+        CancellationToken cancellationToken = default)
+    {
+        var query = BuildHistoryQuery(fromEnteredDateTime, toEnteredDateTime);
+        var orders = await this.httpClient.GetFromJsonAsync<List<BrokerOrderDto>>(
+            $"{this.settings.BackendBaseUrl}/api/broker/orders{query}",
+            JsonOptions,
+            cancellationToken);
+
+        return orders ?? [];
+    }
+
+    public async Task<IReadOnlyList<BrokerExecutionDto>> GetExecutionsAsync(CancellationToken cancellationToken = default)
+    {
+        var executions = await this.httpClient.GetFromJsonAsync<List<BrokerExecutionDto>>(
+            $"{this.settings.BackendBaseUrl}/api/broker/executions",
+            JsonOptions,
+            cancellationToken);
+
+        return executions ?? [];
+    }
+
+    public async Task<IReadOnlyList<BrokerExecutionDto>> GetExecutionsAsync(
+        DateTime? fromEnteredDateTime,
+        DateTime? toEnteredDateTime,
+        CancellationToken cancellationToken = default)
+    {
+        var query = BuildHistoryQuery(fromEnteredDateTime, toEnteredDateTime);
+        var executions = await this.httpClient.GetFromJsonAsync<List<BrokerExecutionDto>>(
+            $"{this.settings.BackendBaseUrl}/api/broker/executions{query}",
+            JsonOptions,
+            cancellationToken);
+
+        return executions ?? [];
+    }
+
     public async Task<BrokerOrderResultDto?> PlaceOrderAsync(
         string accountHash,
         string symbol,
@@ -224,6 +262,17 @@ public sealed class SchwabBackendClient
         }
 
         return body;
+    }
+
+    private static string BuildHistoryQuery(DateTime? fromEnteredDateTime, DateTime? toEnteredDateTime)
+    {
+        var queryParts = new List<string>();
+        if (fromEnteredDateTime.HasValue)
+            queryParts.Add($"from_entered_datetime={Uri.EscapeDataString(fromEnteredDateTime.Value.ToUniversalTime().ToString("O"))}");
+        if (toEnteredDateTime.HasValue)
+            queryParts.Add($"to_entered_datetime={Uri.EscapeDataString(toEnteredDateTime.Value.ToUniversalTime().ToString("O"))}");
+
+        return queryParts.Count == 0 ? string.Empty : $"?{string.Join("&", queryParts)}";
     }
 
     private static IReadOnlyList<OptionSeriesDto> ParseOptionSeries(string body)

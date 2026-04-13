@@ -16,7 +16,7 @@ from schwab.orders.equities import (
 )
 from schwab.utils import Utils
 
-from app.models import BrokerAccount, BrokerOrder, BrokerPosition, EquityOrderRequest, ModifyEquityOrderRequest
+from app.models import BrokerAccount, BrokerExecution, BrokerOrder, BrokerPosition, EquityOrderRequest, ModifyEquityOrderRequest
 from app.config import settings
 from app.services.auth import SchwabAuthService
 
@@ -136,11 +136,16 @@ class SchwabBrokerService:
 
         return positions
 
-    def get_orders(self, lookback_days: int = 7) -> list[BrokerOrder]:
+    def get_orders(
+        self,
+        lookback_days: int = 7,
+        from_entered_datetime: datetime | None = None,
+        to_entered_datetime: datetime | None = None,
+    ) -> list[BrokerOrder]:
         client = self.auth_service.create_client()
         _, number_to_hash = self._account_mappings(client)
-        end_time = datetime.now(timezone.utc)
-        start_time = end_time - timedelta(days=lookback_days)
+        end_time = _normalize_datetime(to_entered_datetime) or datetime.now(timezone.utc)
+        start_time = _normalize_datetime(from_entered_datetime) or (end_time - timedelta(days=lookback_days))
         response = client.get_orders_for_all_linked_accounts(
             from_entered_datetime=start_time,
             to_entered_datetime=end_time,
@@ -167,12 +172,79 @@ class SchwabBrokerService:
                     duration=order.get("duration"),
                     session=order.get("session"),
                     entered_time=entered_time,
+                    close_time=_parse_datetime(order.get("closeTime")),
                     quantity=_as_float(leg.get("quantity") or order.get("quantity")),
+                    filled_quantity=_as_float(order.get("filledQuantity")),
+                    remaining_quantity=_as_float(order.get("remainingQuantity")),
+                    average_fill_price=_resolve_average_fill_price(order),
                     price=_extract_order_price(order),
                 )
             )
 
         return orders
+
+    def get_executions(
+        self,
+        lookback_days: int = 7,
+        from_entered_datetime: datetime | None = None,
+        to_entered_datetime: datetime | None = None,
+    ) -> list[BrokerExecution]:
+        client = self.auth_service.create_client()
+        _, number_to_hash = self._account_mappings(client)
+        end_time = _normalize_datetime(to_entered_datetime) or datetime.now(timezone.utc)
+        start_time = _normalize_datetime(from_entered_datetime) or (end_time - timedelta(days=lookback_days))
+        response = client.get_orders_for_all_linked_accounts(
+            from_entered_datetime=start_time,
+            to_entered_datetime=end_time,
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        executions: list[BrokerExecution] = []
+        for order in payload:
+            account_hash = number_to_hash.get(
+                str(order.get("accountNumber", "unknown")),
+                str(order.get("accountNumber", "unknown")),
+            )
+            leg = (order.get("orderLegCollection") or [{}])[0]
+            instrument = leg.get("instrument", {})
+            base_symbol = instrument.get("symbol")
+            instruction = leg.get("instruction")
+            position_effect = leg.get("positionEffect")
+
+            for activity in order.get("orderActivityCollection") or []:
+                if str(activity.get("activityType") or "").upper() != "EXECUTION":
+                    continue
+
+                execution_type = activity.get("executionType")
+                activity_id = str(activity.get("activityId") or order.get("orderId") or "execution")
+                execution_legs = activity.get("executionLegs") or []
+
+                for index, execution_leg in enumerate(execution_legs, start=1):
+                    quantity = _as_float(execution_leg.get("quantity") or activity.get("quantity"))
+                    price = _as_float(execution_leg.get("price"))
+                    executed_time = _parse_datetime(execution_leg.get("time")) or _parse_datetime(order.get("closeTime")) or _parse_datetime(order.get("enteredTime"))
+                    gross_amount = quantity * price if quantity is not None and price is not None and quantity > 0 and price > 0 else None
+
+                    executions.append(
+                        BrokerExecution(
+                            account_hash=account_hash,
+                            execution_id=f"{order.get('orderId', 'unknown')}:{activity_id}:{index}",
+                            order_id=str(order.get("orderId", "unknown")),
+                            symbol=base_symbol,
+                            instruction=instruction,
+                            execution_type=execution_type,
+                            position_effect=position_effect,
+                            executed_time=executed_time,
+                            quantity=quantity,
+                            price=price,
+                            gross_amount=gross_amount,
+                            fees=None,
+                        )
+                    )
+
+        executions.sort(key=lambda item: item.executed_time or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        return executions
 
     def preview_order(self, request: EquityOrderRequest) -> dict[str, object]:
         client = self.auth_service.create_client()
@@ -376,12 +448,40 @@ def _extract_order_price(order: dict) -> float | None:
     return None
 
 
+def _resolve_average_fill_price(order: dict) -> float | None:
+    total_quantity = 0.0
+    total_notional = 0.0
+    for activity in order.get("orderActivityCollection") or []:
+        for execution_leg in activity.get("executionLegs") or []:
+            quantity = _as_float(execution_leg.get("quantity"))
+            price = _as_float(execution_leg.get("price"))
+            if quantity is None or price is None or quantity <= 0 or price <= 0:
+                continue
+            total_quantity += quantity
+            total_notional += quantity * price
+
+    if total_quantity > 0:
+        return total_notional / total_quantity
+
+    return _extract_order_price(order)
+
+
 def _parse_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
 
     normalized = value.replace("Z", "+00:00")
     return datetime.fromisoformat(normalized)
+
+
+def _normalize_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+
+    return value.astimezone(timezone.utc)
 
 
 def _resolve_market_price(position: dict) -> float | None:

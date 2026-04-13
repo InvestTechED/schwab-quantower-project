@@ -1,12 +1,15 @@
 import logging
+import operator
 from datetime import date, datetime, timedelta, timezone
 from time import sleep
 
 import httpx
+from httpx import HTTPStatusError
 
 from app.config import settings
 from app.models import Bar, MarketSnapshot, OptionChain, OptionContract, OptionSeries, SymbolProfile
 from app.services.auth import SchwabAuthService
+from app.services.screener_universe import SCREENING_UNIVERSE
 from app.services.symbols import denormalize_symbol, display_symbol, normalize_symbol
 
 logger = logging.getLogger(__name__)
@@ -40,78 +43,15 @@ class SchwabMarketDataService:
             response.raise_for_status()
 
             payload = _extract_quote_payload(response.json(), schwab_symbol)
-            quote = payload.get("quote", {})
-            fundamental = payload.get("fundamental", {})
-            regular = payload.get("regular", {})
             instrument = self._get_instrument(None, schwab_symbol)
-
-            last = _as_float(
-                regular.get("regularMarketLastPrice")
-                or quote.get("lastPrice")
-                or quote.get("mark")
-                or quote.get("bidPrice")
-                or quote.get("askPrice")
-            )
-            bid = _as_float(quote.get("bidPrice")) or last
-            ask = _as_float(quote.get("askPrice")) or last
-            bid_size = int(_as_float(quote.get("bidSize")) or 0)
-            ask_size = int(_as_float(quote.get("askSize")) or 0)
-            open_price = _as_float(quote.get("openPrice")) or last
-            high = _as_float(quote.get("highPrice")) or last
-            low = _as_float(quote.get("lowPrice")) or last
-            close = _as_float(quote.get("closePrice")) or last
-            volume = int(_as_float(quote.get("totalVolume")) or 0)
-            avg_10d_volume = _as_float(fundamental.get("avg10DaysVolume")) or 0.0
-            relative_volume = (volume / avg_10d_volume) if avg_10d_volume > 0 else 0.0
-
-            if last > open_price:
-                trend_state = "bullish"
-            elif last < open_price:
-                trend_state = "bearish"
-            else:
-                trend_state = "neutral"
-
-            session_mid = (high + low) / 2 if high and low else last
-            if last > session_mid:
-                vwap_bias = "above"
-            elif last < session_mid:
-                vwap_bias = "below"
-            else:
-                vwap_bias = "flat"
-
-            quote_time_ms = (
-                regular.get("regularMarketTradeTime")
-                or quote.get("tradeTime")
-                or quote.get("quoteTime")
-            )
-            as_of = (
-                datetime.fromtimestamp(int(quote_time_ms) / 1000, tz=timezone.utc)
-                if quote_time_ms
-                else datetime.now(timezone.utc)
-            )
-
-            snapshot = MarketSnapshot(
-                symbol=requested_symbol,
-                as_of=as_of,
-                last=last,
-                bid=bid,
-                ask=ask,
-                bid_size=bid_size,
-                ask_size=ask_size,
-                open=open_price,
-                high=high,
-                low=low,
-                close=close,
-                volume=volume,
-                asset_type=instrument.get("assetType") or quote.get("quoteType") or quote.get("assetMainType"),
-                description=instrument.get("description") or quote.get("description") or requested_symbol,
-                exchange=instrument.get("exchange") or quote.get("exchangeName") or "US",
-                relative_volume=relative_volume,
-                trend_state=trend_state,
-                vwap_bias=vwap_bias,
-            )
+            snapshot = self._snapshot_from_quote_payload(requested_symbol, schwab_symbol, payload, instrument)
             self._snapshot_cache[requested_symbol] = (now, snapshot)
             return snapshot
+        except HTTPStatusError as exc:
+            logger.exception("get_snapshot failed for symbol=%s", requested_symbol)
+            if cached_snapshot:
+                return cached_snapshot[1]
+            raise
         except Exception:
             logger.exception("get_snapshot failed for symbol=%s", requested_symbol)
             if cached_snapshot:
@@ -155,6 +95,9 @@ class SchwabMarketDataService:
         if not requested_query:
             return []
 
+        if _looks_like_screener_query(requested_query):
+            return self.screen_symbols(requested_query, limit=max(limit, 25))
+
         client = self.auth_service.create_client()
         results: dict[str, SymbolProfile] = {}
 
@@ -190,6 +133,204 @@ class SchwabMarketDataService:
             ordered = ordered[:limit]
 
         return ordered
+
+    def screen_symbols(self, query: str, limit: int = 25) -> list[SymbolProfile]:
+        parsed = _parse_screener_query(query)
+        if not parsed["filters"] and not parsed["text_terms"] and parsed["asset_type"] is None and parsed["optionable"] is None:
+            normalized_query = query.strip().lower()
+            if normalized_query not in {"gainers", "losers", "active", "mostactive", "rvol", "relvol", "gapup", "gapdown"}:
+                return []
+
+        snapshots = self._get_screening_snapshots(SCREENING_UNIVERSE)
+        ranked: list[tuple[tuple[float, float, float], SymbolProfile]] = []
+
+        for symbol in SCREENING_UNIVERSE:
+            snapshot = snapshots.get(symbol)
+            if snapshot is None or snapshot.last <= 0:
+                continue
+
+            if not self._snapshot_matches_filters(snapshot, parsed["filters"]):
+                continue
+
+            profile: SymbolProfile | None = None
+            if parsed["asset_type"] is not None or parsed["optionable"] is not None or parsed["text_terms"]:
+                try:
+                    profile = self.get_symbol_profile(symbol)
+                except Exception:
+                    logger.warning("screen_symbols profile lookup failed for symbol=%s", symbol)
+                    continue
+
+                if parsed["asset_type"] is not None and (profile.asset_type or "").upper() != parsed["asset_type"]:
+                    continue
+
+                if parsed["optionable"] is not None and profile.options_available != parsed["optionable"]:
+                    continue
+
+                if parsed["text_terms"] and not _matches_text_terms(profile, parsed["text_terms"]):
+                    continue
+            else:
+                profile = SymbolProfile(
+                    symbol=symbol,
+                    normalized_symbol=normalize_symbol(symbol),
+                    description=symbol,
+                )
+
+            description = _format_screening_description(snapshot, profile.description or symbol)
+            ranked.append(
+                (
+                    _screen_sort_key(snapshot, str(parsed["sort"])),
+                    profile.model_copy(update={"description": description}),
+                )
+            )
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return [profile for _, profile in ranked[:limit]]
+
+    def _get_screening_snapshots(self, symbols: tuple[str, ...]) -> dict[str, MarketSnapshot]:
+        snapshots: dict[str, MarketSnapshot] = {}
+        now = datetime.now(timezone.utc)
+        symbols_to_fetch: list[str] = []
+
+        for symbol in symbols:
+            cached_snapshot = self._snapshot_cache.get(symbol)
+            if cached_snapshot and now - cached_snapshot[0] <= self._snapshot_ttl:
+                snapshots[symbol] = cached_snapshot[1]
+            else:
+                symbols_to_fetch.append(symbol)
+
+        if not symbols_to_fetch:
+            return snapshots
+
+        for chunk in _chunked(symbols_to_fetch, 40):
+            try:
+                response = self._request_with_retry(lambda client: client.get_quotes([normalize_symbol(symbol) for symbol in chunk]))
+                response.raise_for_status()
+                payload = response.json()
+            except Exception:
+                logger.warning("screen_symbols batch quote lookup failed for symbols=%s", ",".join(chunk[:5]))
+                for symbol in chunk:
+                    try:
+                        snapshots[symbol] = self.get_snapshot(symbol)
+                    except Exception:
+                        logger.warning("screen_symbols single quote fallback failed for symbol=%s", symbol)
+                continue
+
+            for symbol in chunk:
+                schwab_symbol = normalize_symbol(symbol)
+                quote_payload = _extract_quote_payload(payload, schwab_symbol)
+                if not quote_payload:
+                    continue
+
+                try:
+                    snapshot = self._snapshot_from_quote_payload(symbol, schwab_symbol, quote_payload)
+                except Exception:
+                    logger.warning("screen_symbols snapshot build failed for symbol=%s", symbol)
+                    continue
+
+                self._snapshot_cache[symbol] = (now, snapshot)
+                snapshots[symbol] = snapshot
+
+            missing_symbols = [symbol for symbol in chunk if symbol not in snapshots]
+            for symbol in missing_symbols:
+                try:
+                    snapshots[symbol] = self.get_snapshot(symbol)
+                except Exception:
+                    logger.warning("screen_symbols missing quote fallback failed for symbol=%s", symbol)
+
+        return snapshots
+
+    def _snapshot_matches_filters(self, snapshot: MarketSnapshot, filters: list[dict[str, object]]) -> bool:
+        for filter_item in filters:
+            metric_name = str(filter_item["metric"])
+            metric_value = _snapshot_metric_value(snapshot, metric_name)
+            if metric_value is None:
+                return False
+
+            comparator = filter_item["comparator"]
+            threshold = float(filter_item["value"])
+            if not comparator(metric_value, threshold):
+                return False
+
+        return True
+
+    def _snapshot_from_quote_payload(
+        self,
+        requested_symbol: str,
+        schwab_symbol: str,
+        payload: dict,
+        instrument: dict | None = None,
+    ) -> MarketSnapshot:
+        quote = payload.get("quote", {})
+        fundamental = payload.get("fundamental", {})
+        regular = payload.get("regular", {})
+        if instrument is None:
+            instrument = {}
+
+        last = _as_float(
+            regular.get("regularMarketLastPrice")
+            or quote.get("lastPrice")
+            or quote.get("mark")
+            or quote.get("bidPrice")
+            or quote.get("askPrice")
+        ) or 0.0
+        bid = _as_float(quote.get("bidPrice")) or last
+        ask = _as_float(quote.get("askPrice")) or last
+        bid_size = int(_as_float(quote.get("bidSize")) or 0)
+        ask_size = int(_as_float(quote.get("askSize")) or 0)
+        open_price = _as_float(quote.get("openPrice")) or last
+        high = _as_float(quote.get("highPrice")) or last
+        low = _as_float(quote.get("lowPrice")) or last
+        close = _as_float(quote.get("closePrice")) or last
+        volume = int(_as_float(quote.get("totalVolume")) or 0)
+        avg_10d_volume = _as_float(fundamental.get("avg10DaysVolume")) or 0.0
+        relative_volume = (volume / avg_10d_volume) if avg_10d_volume > 0 else 0.0
+
+        if last > open_price:
+            trend_state = "bullish"
+        elif last < open_price:
+            trend_state = "bearish"
+        else:
+            trend_state = "neutral"
+
+        session_mid = (high + low) / 2 if high and low else last
+        if last > session_mid:
+            vwap_bias = "above"
+        elif last < session_mid:
+            vwap_bias = "below"
+        else:
+            vwap_bias = "flat"
+
+        quote_time_ms = (
+            regular.get("regularMarketTradeTime")
+            or quote.get("tradeTime")
+            or quote.get("quoteTime")
+        )
+        as_of = (
+            datetime.fromtimestamp(int(quote_time_ms) / 1000, tz=timezone.utc)
+            if quote_time_ms
+            else datetime.now(timezone.utc)
+        )
+
+        return MarketSnapshot(
+            symbol=requested_symbol,
+            as_of=as_of,
+            last=last,
+            bid=bid,
+            ask=ask,
+            bid_size=bid_size,
+            ask_size=ask_size,
+            open=open_price,
+            high=high,
+            low=low,
+            close=close,
+            volume=volume,
+            asset_type=instrument.get("assetType") or quote.get("quoteType") or quote.get("assetMainType"),
+            description=instrument.get("description") or quote.get("description") or requested_symbol,
+            exchange=instrument.get("exchange") or quote.get("exchangeName") or "US",
+            relative_volume=relative_volume,
+            trend_state=trend_state,
+            vwap_bias=vwap_bias,
+        )
 
     def get_option_series(self, symbol: str) -> list[OptionSeries]:
         requested_symbol = display_symbol(symbol)
@@ -628,6 +769,180 @@ def _symbol_profile_from_instrument(instrument: dict) -> SymbolProfile | None:
         exchange=instrument.get("exchange") or "US",
         options_available=instrument.get("assetType") in {"EQUITY", "ETF", "INDEX", "INDX", "COLLECTIVE_INVESTMENT"},
     )
+
+
+def _looks_like_screener_query(query: str) -> bool:
+    normalized = query.strip().upper()
+    if normalized.startswith(("SCREEN ", "SCAN ", "FILTER ")):
+        return True
+
+    if normalized in {"GAINERS", "LOSERS", "ACTIVE", "MOSTACTIVE", "RVOL", "RELVOL", "GAPUP", "GAPDOWN"}:
+        return True
+
+    return any(token in normalized for token in (">", "<", "=")) and any(
+        key in normalized for key in ("PRICE", "CHANGE", "CHG", "VOLUME", "VOL", "RVOL", "OPTION", "ASSET", "GAP")
+    )
+
+
+def _parse_screener_query(query: str) -> dict[str, object]:
+    text = query.strip()
+    lowered_text = text.lower()
+    for prefix in ("screen ", "scan ", "filter "):
+        if lowered_text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+
+    parsed: dict[str, object] = {
+        "filters": [],
+        "text_terms": [],
+        "optionable": None,
+        "asset_type": None,
+        "sort": "change_desc",
+    }
+
+    for token in text.split():
+        lowered = token.lower()
+        if lowered in {"gainers", "topgainers"}:
+            parsed["sort"] = "change_desc"
+            continue
+        if lowered in {"losers", "toplosers"}:
+            parsed["sort"] = "change_asc"
+            continue
+        if lowered in {"active", "mostactive"}:
+            parsed["sort"] = "volume_desc"
+            continue
+        if lowered in {"rvol", "relvol", "relativevolume"}:
+            parsed["sort"] = "rvol_desc"
+            continue
+        if lowered == "gapup":
+            parsed["sort"] = "gap_desc"
+            continue
+        if lowered == "gapdown":
+            parsed["sort"] = "gap_asc"
+            continue
+        if lowered in {"optionable", "options", "hasoptions"}:
+            parsed["optionable"] = True
+            continue
+        if lowered in {"nooptions", "notoptionable"}:
+            parsed["optionable"] = False
+            continue
+        if lowered in {"etf", "asset=etf"}:
+            parsed["asset_type"] = "ETF"
+            continue
+        if lowered in {"stock", "equity", "asset=equity"}:
+            parsed["asset_type"] = "EQUITY"
+            continue
+
+        comparison = _parse_filter_token(token)
+        if comparison is not None:
+            filters = parsed["filters"]
+            assert isinstance(filters, list)
+            filters.append(comparison)
+            continue
+
+        text_terms = parsed["text_terms"]
+        assert isinstance(text_terms, list)
+        text_terms.append(lowered)
+
+    return parsed
+
+
+def _parse_filter_token(token: str) -> dict[str, object] | None:
+    for marker, comparator in ((">=", operator.ge), ("<=", operator.le), (">", operator.gt), ("<", operator.lt), ("=", operator.eq)):
+        if marker not in token:
+            continue
+
+        metric, raw_value = token.split(marker, 1)
+        metric = metric.strip().lower()
+        metric_alias = {
+            "chg": "change",
+            "vol": "volume",
+            "relvol": "rvol",
+        }.get(metric, metric)
+        if metric_alias not in {"price", "change", "volume", "rvol", "gap"}:
+            return None
+
+        parsed_value = _parse_numeric_filter_value(raw_value)
+        if parsed_value is None:
+            return None
+
+        return {"metric": metric_alias, "comparator": comparator, "value": parsed_value}
+
+    return None
+
+
+def _parse_numeric_filter_value(value: str) -> float | None:
+    raw = value.strip().lower().replace(",", "")
+    multiplier = 1.0
+    if raw.endswith("k"):
+        multiplier = 1_000.0
+        raw = raw[:-1]
+    elif raw.endswith("m"):
+        multiplier = 1_000_000.0
+        raw = raw[:-1]
+    elif raw.endswith("b"):
+        multiplier = 1_000_000_000.0
+        raw = raw[:-1]
+
+    parsed = _as_float(raw)
+    return None if parsed is None else parsed * multiplier
+
+
+def _snapshot_metric_value(snapshot: MarketSnapshot, metric: str) -> float | None:
+    if metric == "price":
+        return snapshot.last
+    if metric == "change":
+        return _screen_change_percent(snapshot)
+    if metric == "volume":
+        return float(snapshot.volume)
+    if metric == "rvol":
+        return snapshot.relative_volume
+    if metric == "gap":
+        if snapshot.close == 0:
+            return None
+        return ((snapshot.open - snapshot.close) / snapshot.close) * 100.0
+    return None
+
+
+def _screen_change_percent(snapshot: MarketSnapshot) -> float:
+    if snapshot.close == 0:
+        return 0.0
+    return ((snapshot.last - snapshot.close) / snapshot.close) * 100.0
+
+
+def _matches_text_terms(profile: SymbolProfile, text_terms: list[str]) -> bool:
+    haystack = f"{profile.symbol} {profile.description or ''}".lower()
+    return all(term in haystack for term in text_terms)
+
+
+def _format_screening_description(snapshot: MarketSnapshot, base_description: str) -> str:
+    return (
+        f"{base_description} | ${snapshot.last:.2f} | "
+        f"{_screen_change_percent(snapshot):+.2f}% | "
+        f"Vol {snapshot.volume:,} | RVOL {snapshot.relative_volume:.2f}x"
+    )
+
+
+def _screen_sort_key(snapshot: MarketSnapshot, sort_mode: str) -> tuple[float, float, float]:
+    change_pct = _screen_change_percent(snapshot)
+    gap_pct = _snapshot_metric_value(snapshot, "gap") or 0.0
+
+    if sort_mode == "change_asc":
+        return (-change_pct, -snapshot.relative_volume, -float(snapshot.volume))
+    if sort_mode == "volume_desc":
+        return (float(snapshot.volume), snapshot.relative_volume, change_pct)
+    if sort_mode == "rvol_desc":
+        return (snapshot.relative_volume, float(snapshot.volume), change_pct)
+    if sort_mode == "gap_desc":
+        return (gap_pct, snapshot.relative_volume, float(snapshot.volume))
+    if sort_mode == "gap_asc":
+        return (-gap_pct, -snapshot.relative_volume, -float(snapshot.volume))
+
+    return (change_pct, snapshot.relative_volume, float(snapshot.volume))
+
+
+def _chunked(items: list[str], size: int) -> list[list[str]]:
+    return [items[index:index + size] for index in range(0, len(items), size)]
 
 
 def _as_float(value) -> float | None:

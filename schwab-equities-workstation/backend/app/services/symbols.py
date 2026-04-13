@@ -1,6 +1,7 @@
 SYMBOL_ALIASES: dict[str, str] = {
     "VIX": "$VIX",
     "SPX": "$SPX",
+    "RUT": "$RUT",
 }
 
 DISPLAY_SYMBOL_ALIASES: dict[str, str] = {value: key for key, value in SYMBOL_ALIASES.items()}

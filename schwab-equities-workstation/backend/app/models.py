@@ -167,8 +167,27 @@ class BrokerOrder(BaseModel):
     duration: str | None = None
     session: str | None = None
     entered_time: datetime | None = None
+    close_time: datetime | None = None
+    quantity: float | None = None
+    filled_quantity: float | None = None
+    remaining_quantity: float | None = None
+    average_fill_price: float | None = None
+    price: float | None = None
+
+
+class BrokerExecution(BaseModel):
+    account_hash: str
+    execution_id: str
+    order_id: int | str
+    symbol: str | None = None
+    instruction: str | None = None
+    execution_type: str | None = None
+    position_effect: str | None = None
+    executed_time: datetime | None = None
     quantity: float | None = None
     price: float | None = None
+    gross_amount: float | None = None
+    fees: float | None = None
 
 
 class EquityOrderRequest(BaseModel):
