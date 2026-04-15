@@ -12,11 +12,11 @@
 
   <ItemGroup>
     <Reference Include="TradingPlatform.BusinessLayer">
-      <HintPath>D:\Quantower\TradingPlatform\v1.146.4\bin\TradingPlatform.BusinessLayer.dll</HintPath>
+      <HintPath>D:\Quantower\TradingPlatform\v1.146.5\bin\TradingPlatform.BusinessLayer.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="TradingPlatform.PresentationLayer.Plugins">
-      <HintPath>D:\Quantower\TradingPlatform\v1.146.4\bin\TradingPlatform.PresentationLayer.Plugins.dll</HintPath>
+      <HintPath>D:\Quantower\TradingPlatform\v1.146.5\bin\TradingPlatform.PresentationLayer.Plugins.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>

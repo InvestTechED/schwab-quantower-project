@@ -20,15 +20,7 @@ internal sealed class SchwabMarketDataVendor : Vendor
 {
     private const string ExchangeId = "US";
     private const string OptionExchangeId = "OPR";
-    // Keep startup-safe defaults small; broader named universes should be loaded explicitly later.
-    private static readonly string[] DefaultUniverseSymbols =
-    {
-        "AAPL", "MSFT", "NVDA", "AMD", "META", "TSLA", "INTC",
-        "SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLK", "XLI", "XLV",
-        "MRVL", "SNAP", "FDD", "ASTS", "VIX", "SPX", "RUT"
-    };
     private static readonly TimeSpan OrderPollingInterval = TimeSpan.FromSeconds(1);
-    private static readonly TimeSpan PositionPollingInterval = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan BackendStatusPollingInterval = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan BackendHeartbeatGraceWindow = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan BackendSuccessGraceWindow = TimeSpan.FromSeconds(90);
@@ -50,7 +42,6 @@ internal sealed class SchwabMarketDataVendor : Vendor
     private readonly Dictionary<string, double> latestPrices = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, MarketSnapshotDto> snapshotCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, CachedDomState> domCache = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, Dictionary<string, CachedDomState>> domVenueCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, SymbolProfileDto> symbolProfileCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, MessageSymbol> symbolCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, List<MessageOptionSerie>> optionSeriesCache = new(StringComparer.OrdinalIgnoreCase);
@@ -63,13 +54,10 @@ internal sealed class SchwabMarketDataVendor : Vendor
     private readonly Dictionary<string, string?> orderStatusCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, BrokerOrderDto> orderCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> closedOrderMessagesPushed = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, BrokerPositionDto> positionCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly object syncRoot = new();
     private SchwabBackendClient? backendClient;
     private CancellationTokenSource? orderPollingCancellation;
     private Task? orderPollingTask;
-    private CancellationTokenSource? positionPollingCancellation;
-    private Task? positionPollingTask;
     private CancellationTokenSource? backendStatusPollingCancellation;
     private Task? backendStatusPollingTask;
     private CancellationTokenSource? marketStatePulseCancellation;
@@ -107,7 +95,6 @@ internal sealed class SchwabMarketDataVendor : Vendor
             this.consecutiveBackendHeartbeatFailures = 0;
             this.lastLoggedBackendHeartbeatError = null;
             this.StartOrderPolling();
-            this.StartPositionPolling();
             this.StartBackendStatusPolling();
             this.StartMarketStatePulse();
             LogDiagnostic("Connect success");
@@ -123,7 +110,6 @@ internal sealed class SchwabMarketDataVendor : Vendor
     public override void Disconnect()
     {
         this.StopOrderPolling();
-        this.StopPositionPolling();
         this.StopBackendStatusPolling();
         this.StopMarketStatePulse();
 
@@ -140,14 +126,12 @@ internal sealed class SchwabMarketDataVendor : Vendor
             this.latestPrices.Clear();
             this.snapshotCache.Clear();
             this.domCache.Clear();
-            this.domVenueCache.Clear();
             this.symbolProfileCache.Clear();
             this.optionSeriesCache.Clear();
             this.optionContractCache.Clear();
             this.pendingOptionHydrations.Clear();
             this.orderStatusCache.Clear();
             this.orderCache.Clear();
-            this.positionCache.Clear();
             this.realBookSeen.Clear();
             this.primedSymbols.Clear();
             this.pendingSnapshotRefreshes.Clear();
@@ -204,8 +188,8 @@ internal sealed class SchwabMarketDataVendor : Vendor
         rules.Add(new MessageRule { Name = Rule.ALLOW_MODIFY_ORDER_TYPE, Value = false });
         rules.Add(new MessageRule { Name = Rule.LEVEL2_IS_AGGREGATED, Value = true });
         rules.Add(new MessageRule { Name = Rule.PLACE_ORDER_TRADING_OPERATION_HAS_ORDER_ID, Value = true });
-        rules.Add(new MessageRule { Name = Rule.ALLOW_SCREENER, Value = false });
-        rules.Add(new MessageRule { Name = Rule.ALLOW_CONTAINS_SCREENER_CONDITIONS, Value = false });
+        rules.Add(new MessageRule { Name = Rule.ALLOW_SCREENER, Value = true });
+        rules.Add(new MessageRule { Name = Rule.ALLOW_CONTAINS_SCREENER_CONDITIONS, Value = true });
         return rules;
     }
 
@@ -279,57 +263,27 @@ internal sealed class SchwabMarketDataVendor : Vendor
             .ToList();
     }
 
-    public override IList<MessageOrderHistory> GetOrdersHistory(OrdersHistoryRequestParameters requestParameters)
+    public override TradesHistoryMetadata GetTradesMetadata() => new()
     {
-        if (this.backendClient == null)
-            return new List<MessageOrderHistory>();
+        AllowLocalStorage = true
+    };
 
-        var normalizedFrom = NormalizeHistoryBoundary(requestParameters.From, false);
-        var normalizedTo = NormalizeHistoryBoundary(requestParameters.To, true);
-        var orders = this.backendClient.GetOrdersAsync(normalizedFrom, normalizedTo, CancellationToken.None)
-            .GetAwaiter()
-            .GetResult();
-        this.MarkBackendSuccess();
-        this.PrimeHistorySymbols(orders.Select(order => order.Symbol));
-
-        return orders
-            .Where(order => MatchesOrderHistoryRequest(order, normalizedFrom, normalizedTo, requestParameters.SymbolIds))
-            .Select(CreateOrderHistory)
-            .ToList();
-    }
-
-    public override IList<MessageTrade> GetTrades(TradesHistoryRequestParameters requestParameters)
+    public override IList<MessageTrade> GetTrades(TradesHistoryRequestParameters parameters)
     {
         if (this.backendClient == null)
             return new List<MessageTrade>();
 
-        var normalizedFrom = NormalizeHistoryBoundary(requestParameters.From, false);
-        var normalizedTo = NormalizeHistoryBoundary(requestParameters.To, true);
-        var executions = this.backendClient.GetExecutionsAsync(normalizedFrom, normalizedTo, CancellationToken.None)
+        var trades = this.backendClient.GetTradesAsync(parameters.From, parameters.To, parameters.CancellationToken)
             .GetAwaiter()
             .GetResult();
         this.MarkBackendSuccess();
-        this.PrimeHistorySymbols(executions.Select(execution => execution.Symbol));
 
-        return executions
-            .Where(execution => MatchesTradesHistoryRequest(execution, normalizedFrom, normalizedTo, requestParameters.SymbolIds))
+        return trades
+            .Where(t => !string.IsNullOrWhiteSpace(t.Symbol) && t.Quantity > 0 && t.Price > 0)
             .Select(CreateTrade)
+            .OrderBy(t => t.DateTime)
             .ToList();
     }
-
-    public override void GetTrades(TradesHistoryRequestParameters requestParameters, TradingPlatform.BusinessLayer.Integration.AccountTradesLoadingCallback callback)
-    {
-        var trades = this.GetTrades(requestParameters);
-        callback?.Invoke(trades, true);
-    }
-
-    public override TradesHistoryMetadata GetTradesMetadata() => new()
-    {
-        AllowLocalStorage = false,
-        AllowReloadFromServer = true,
-        AllowSingleSymbolLoading = true,
-        LoadTradesFromCurrentTradingDate = false
-    };
 
     public override IList<OrderType> GetAllowedOrderTypes(CancellationToken token) => new List<OrderType>
     {
@@ -555,10 +509,8 @@ internal sealed class SchwabMarketDataVendor : Vendor
 
     public override IList<MessageSymbol> GetSymbols(CancellationToken token)
     {
-        return DefaultUniverseSymbols
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Select(this.CreateMessageSymbol)
-            .ToList();
+        var defaults = new[] { "AAPL", "MSFT", "NVDA", "AMD", "META", "TSLA", "INTC", "SPY", "QQQ", "VIX", "SPX" };
+        return defaults.Select(this.CreateMessageSymbol).ToList();
     }
 
     public override IList<MessageOptionSerie> GetAllOptionSeries(CancellationToken token)
@@ -759,25 +711,25 @@ internal sealed class SchwabMarketDataVendor : Vendor
             return new List<MessageSymbolInfo>();
 
         if (this.backendClient == null)
-            return new List<MessageSymbolInfo> { this.CreateSearchResultSymbol(requestParameters.FilterName) };
+            return new List<MessageSymbolInfo> { this.CreateMessageSymbol(requestParameters.FilterName) };
 
         try
         {
-            var matches = this.backendClient.SearchSymbolsAsync(requestParameters.FilterName, 50)
+            var matches = this.backendClient.SearchSymbolsAsync(requestParameters.FilterName, 12)
                 .GetAwaiter()
                 .GetResult();
 
             if (matches.Count == 0)
-                return new List<MessageSymbolInfo> { this.CreateSearchResultSymbol(requestParameters.FilterName) };
+                return new List<MessageSymbolInfo> { this.CreateMessageSymbol(requestParameters.FilterName) };
 
             return matches
-                .Select(profile => this.CreateMessageSymbolFromProfile(profile, primeRealtimeIfMissing: false))
+                .Select(this.CreateMessageSymbolFromProfile)
                 .Cast<MessageSymbolInfo>()
                 .ToList();
         }
         catch
         {
-            return new List<MessageSymbolInfo> { this.CreateSearchResultSymbol(requestParameters.FilterName) };
+            return new List<MessageSymbolInfo> { this.CreateMessageSymbol(requestParameters.FilterName) };
         }
     }
 
@@ -903,15 +855,6 @@ internal sealed class SchwabMarketDataVendor : Vendor
         this.orderPollingTask = Task.Run(() => this.RunOrderPollingAsync(cancellation.Token));
     }
 
-    private void StartPositionPolling()
-    {
-        this.StopPositionPolling();
-
-        var cancellation = new CancellationTokenSource();
-        this.positionPollingCancellation = cancellation;
-        this.positionPollingTask = Task.Run(() => this.RunPositionPollingAsync(cancellation.Token));
-    }
-
     private void StopOrderPolling()
     {
         var cancellation = this.orderPollingCancellation;
@@ -949,30 +892,6 @@ internal sealed class SchwabMarketDataVendor : Vendor
         }
     }
 
-    private async Task RunPositionPollingAsync(CancellationToken token)
-    {
-        if (this.IsBackendOperational())
-            await this.RefreshPositionsAsync(token);
-
-        while (!token.IsCancellationRequested)
-        {
-            try
-            {
-                await Task.Delay(PositionPollingInterval, token);
-                if (this.IsBackendOperational())
-                    await this.RefreshPositionsAsync(token);
-            }
-            catch (OperationCanceledException) when (token.IsCancellationRequested)
-            {
-            }
-            catch (Exception ex)
-            {
-                Core.Instance.Loggers.Log(ex);
-                LogDiagnostic($"PositionPolling error={ex.Message}");
-            }
-        }
-    }
-
     private void RefreshOrdersInBackground()
     {
         if (!this.IsBackendOperational())
@@ -1000,42 +919,6 @@ internal sealed class SchwabMarketDataVendor : Vendor
         }, token);
     }
 
-    private async Task RefreshPositionsAsync(CancellationToken token)
-    {
-        var client = this.backendClient;
-        if (client == null)
-            return;
-
-        var positions = await client.GetPositionsAsync(token);
-        this.MarkBackendSuccess();
-        this.ReconcilePositions(positions);
-    }
-
-    private void ReconcilePositions(IReadOnlyList<BrokerPositionDto> positions)
-    {
-        var openMessages = new List<MessageOpenPosition>();
-
-        lock (this.syncRoot)
-        {
-            foreach (var position in positions.Where(p => !string.IsNullOrWhiteSpace(p.Symbol) && Math.Abs(p.Quantity) > 0))
-            {
-                var key = GetPositionKey(position);
-                var changed = !this.positionCache.TryGetValue(key, out var existing) || PositionChanged(existing, position);
-                this.positionCache[key] = position;
-
-                this.PrimeRealtimeSymbol(position.Symbol);
-                if (position.MarketPrice is > 0)
-                    this.latestPrices[NormalizeSymbolKey(position.Symbol)] = position.MarketPrice.Value;
-
-                if (changed)
-                    openMessages.Add(CreatePosition(position));
-            }
-        }
-
-        foreach (var message in openMessages)
-            this.PushMessage(message);
-    }
-
     private void StartBackendStatusPolling()
     {
         this.StopBackendStatusPolling();
@@ -1059,19 +942,6 @@ internal sealed class SchwabMarketDataVendor : Vendor
         var cancellation = this.marketStatePulseCancellation;
         this.marketStatePulseCancellation = null;
         this.marketStatePulseTask = null;
-
-        if (cancellation == null)
-            return;
-
-        cancellation.Cancel();
-        cancellation.Dispose();
-    }
-
-    private void StopPositionPolling()
-    {
-        var cancellation = this.positionPollingCancellation;
-        this.positionPollingCancellation = null;
-        this.positionPollingTask = null;
 
         if (cancellation == null)
             return;
@@ -1694,12 +1564,7 @@ internal sealed class SchwabMarketDataVendor : Vendor
         }
 
         if (string.Equals(eventType, "book", StringComparison.OrdinalIgnoreCase))
-        {
-            var venue = root.TryGetProperty("venue", out var venueElement)
-                ? venueElement.GetString()
-                : null;
-            this.PublishBookEvent(symbol, payload, venue);
-        }
+            this.PublishBookEvent(symbol, payload);
     }
 
     private void PublishQuoteEvent(string symbol, JsonElement payload)
@@ -1779,7 +1644,7 @@ internal sealed class SchwabMarketDataVendor : Vendor
         // come from live last-trade fields, not candle aggregate volume.
     }
 
-    private void PublishBookEvent(string symbol, JsonElement payload, string? venue)
+    private void PublishBookEvent(string symbol, JsonElement payload)
     {
         if (!this.HasLevel2Subscription(symbol))
             return;
@@ -1823,37 +1688,13 @@ internal sealed class SchwabMarketDataVendor : Vendor
 
         if (dom.Bids.Count > 0 || dom.Asks.Count > 0)
         {
-            CachedDomState mergedDom;
             lock (this.syncRoot)
             {
                 this.realBookSeen.Add(symbol);
-                if (!this.domVenueCache.TryGetValue(symbol, out var venueStates))
-                {
-                    venueStates = new Dictionary<string, CachedDomState>(StringComparer.OrdinalIgnoreCase);
-                    this.domVenueCache[symbol] = venueStates;
-                }
-
-                var venueKey = string.IsNullOrWhiteSpace(venue) ? "__BOOK__" : venue!;
-                venueStates.TryGetValue(venueKey, out var existingVenueState);
-                venueStates[venueKey] = CachedDomState.MergeBookUpdate(existingVenueState, dom, isRealBook: true);
-                var cutoffUtc = DateTime.UtcNow - RealBookFreshnessWindow;
-                foreach (var staleVenue in venueStates
-                             .Where(pair => pair.Value.TimestampUtc < cutoffUtc)
-                             .Select(pair => pair.Key)
-                             .ToList())
-                {
-                    venueStates.Remove(staleVenue);
-                }
-
-                mergedDom = CachedDomState.MergeVenueStates(venueStates.Values);
-                if (this.snapshotCache.TryGetValue(symbol, out var snapshot))
-                {
-                    mergedDom = CachedDomState.ClampToNbbo(mergedDom, snapshot.Bid, snapshot.Ask);
-                }
-                this.domCache[symbol] = mergedDom;
+                this.domCache[symbol] = CachedDomState.FromDomQuote(dom, isRealBook: true);
             }
-            LogDiagnostic($"PublishBook symbol={symbol} venue={venue ?? "UNKNOWN"} bids={mergedDom.Bids.Count} asks={mergedDom.Asks.Count}", verbose: true);
-            this.PushMessage(mergedDom.ToDomQuote(symbol));
+            LogDiagnostic($"PublishBook symbol={symbol} bids={dom.Bids.Count} asks={dom.Asks.Count}", verbose: true);
+            this.PushMessage(dom);
         }
     }
 
@@ -1944,11 +1785,7 @@ internal sealed class SchwabMarketDataVendor : Vendor
         }
     }
 
-    private MessageSymbol CreateSearchResultSymbol(string rawSymbol) => this.CreateMessageSymbol(rawSymbol, primeRealtimeIfMissing: false);
-
-    private MessageSymbol CreateMessageSymbol(string rawSymbol) => this.CreateMessageSymbol(rawSymbol, primeRealtimeIfMissing: true);
-
-    private MessageSymbol CreateMessageSymbol(string rawSymbol, bool primeRealtimeIfMissing)
+    private MessageSymbol CreateMessageSymbol(string rawSymbol)
     {
         var symbol = rawSymbol.Trim().ToUpperInvariant();
         lock (this.syncRoot)
@@ -1965,13 +1802,13 @@ internal sealed class SchwabMarketDataVendor : Vendor
             this.symbolProfileCache.TryGetValue(symbol, out profile);
         }
 
-        if (snapshot == null && primeRealtimeIfMissing)
+        if (snapshot == null)
             this.PrimeRealtimeSymbol(symbol);
 
         return this.CreateMessageSymbolCore(symbol, snapshot, profile);
     }
 
-    private MessageSymbol CreateMessageSymbolFromProfile(SymbolProfileDto profile, bool primeRealtimeIfMissing = true)
+    private MessageSymbol CreateMessageSymbolFromProfile(SymbolProfileDto profile)
     {
         var symbol = profile.Symbol.Trim().ToUpperInvariant();
         lock (this.syncRoot)
@@ -1986,7 +1823,7 @@ internal sealed class SchwabMarketDataVendor : Vendor
             this.snapshotCache.TryGetValue(symbol, out snapshot);
         }
 
-        if (snapshot == null && primeRealtimeIfMissing)
+        if (snapshot == null)
             this.PrimeRealtimeSymbol(symbol);
 
         return this.CreateMessageSymbolCore(symbol, snapshot, profile);
@@ -2196,14 +2033,8 @@ internal sealed class SchwabMarketDataVendor : Vendor
             MaxLot = int.MaxValue,
             AllowCalculateRealtimeChange = true,
             AllowCalculateRealtimeVolume = true,
-            // Schwab option-chain payloads do not include a trustworthy per-contract
-            // tick/trade count in this integration path. Letting QT derive tick-based
-            // metrics here produces repeated misleading values in the option grid.
-            AllowCalculateRealtimeTicks = false,
-            // Schwab option-chain payloads give us volume/OI/greeks, but not a
-            // trustworthy per-contract trade-count metric in this path. Letting
-            // QT infer trades here produces repeated misleading values.
-            AllowCalculateRealtimeTrades = false,
+            AllowCalculateRealtimeTicks = true,
+            AllowCalculateRealtimeTrades = true,
             AllowAbbreviatePriceByTickSize = true,
             OptionType = string.Equals(contract.OptionType, "PUT", StringComparison.OrdinalIgnoreCase) ? OptionType.Put : OptionType.Call,
             StrikePrice = contract.StrikePrice,
@@ -2614,28 +2445,6 @@ internal sealed class SchwabMarketDataVendor : Vendor
         Volume = bar.Volume
     };
 
-    private static string GetPositionKey(BrokerPositionDto position) =>
-        $"{position.AccountHash}:{NormalizeSymbolKey(position.Symbol)}";
-
-    private static bool PositionChanged(BrokerPositionDto existing, BrokerPositionDto updated) =>
-        Math.Abs(existing.Quantity - updated.Quantity) > double.Epsilon ||
-        NullableChanged(existing.AveragePrice, updated.AveragePrice) ||
-        NullableChanged(existing.MarketPrice, updated.MarketPrice) ||
-        NullableChanged(existing.MarketValue, updated.MarketValue) ||
-        NullableChanged(existing.DayProfitLoss, updated.DayProfitLoss) ||
-        NullableChanged(existing.DayProfitLossPercent, updated.DayProfitLossPercent) ||
-        NullableChanged(existing.UnrealizedProfitLoss, updated.UnrealizedProfitLoss);
-
-    private static bool NullableChanged(double? left, double? right)
-    {
-        if (left is null && right is null)
-            return false;
-        if (left is null || right is null)
-            return true;
-
-        return Math.Abs(left.Value - right.Value) > double.Epsilon;
-    }
-
     private static void LogDiagnostic(string message, bool verbose = false)
     {
         if (verbose && !VerboseDiagnosticsEnabled)
@@ -2870,7 +2679,9 @@ internal sealed class SchwabMarketDataVendor : Vendor
             OrderTypeId = string.Equals(order.OrderType, "LIMIT", StringComparison.OrdinalIgnoreCase)
                 ? OrderType.Limit
                 : OrderType.Market,
-            Side = ResolveSide(order.Instruction),
+            Side = string.Equals(order.Instruction, "BUY", StringComparison.OrdinalIgnoreCase)
+                ? Side.Buy
+                : Side.Sell,
             Status = ConvertOrderStatus(order.Status),
             TimeInForce = ConvertTimeInForce(order.Duration),
             TotalQuantity = order.Quantity ?? 0d,
@@ -2881,65 +2692,19 @@ internal sealed class SchwabMarketDataVendor : Vendor
         return message;
     }
 
-    private static MessageOrderHistory CreateOrderHistory(BrokerOrderDto order)
-    {
-        return new MessageOrderHistory(order.Symbol ?? string.Empty)
+    private static MessageTrade CreateTrade(BrokerTradeDto trade) =>
+        new()
         {
-            AccountId = order.AccountHash,
-            OrderId = order.OrderId,
-            Price = order.Price ?? double.NaN,
-            AverageFillPrice = order.AverageFillPrice ?? order.Price ?? double.NaN,
-            OrderTypeId = string.Equals(order.OrderType, "LIMIT", StringComparison.OrdinalIgnoreCase)
-                ? OrderType.Limit
-                : OrderType.Market,
-            Side = ResolveSide(order.Instruction),
-            Status = ConvertOrderStatus(order.Status),
-            TimeInForce = ConvertTimeInForce(order.Duration),
-            TotalQuantity = order.Quantity ?? 0d,
-            FilledQuantity = order.FilledQuantity ?? 0d,
-            LastUpdateTime = order.CloseTime?.UtcDateTime ?? order.EnteredTime?.UtcDateTime ?? DateTime.UtcNow,
-            OriginalStatus = order.Status,
-            Comment = BuildOrderComment(order)
+            TradeId = trade.TradeId,
+            SymbolId = trade.Symbol,
+            AccountId = trade.AccountHash,
+            Price = trade.Price,
+            Quantity = trade.Quantity,
+            DateTime = trade.ExecutedTime.UtcDateTime,
+            Side = IsBuyInstruction(trade.Instruction) ? Side.Buy : Side.Sell,
+            OrderId = trade.OrderId ?? string.Empty,
+            OrderTypeId = OrderType.Limit
         };
-    }
-
-    private static MessageTrade CreateTrade(BrokerExecutionDto execution)
-    {
-        var grossPnl = new PnLItem
-        {
-            AssetID = "USD",
-            Value = execution.GrossAmount ?? 0d
-        };
-        var fee = new PnLItem
-        {
-            AssetID = "USD",
-            Value = execution.Fees ?? 0d
-        };
-        var net = new PnLItem
-        {
-            AssetID = "USD",
-            Value = (execution.GrossAmount ?? 0d) - (execution.Fees ?? 0d)
-        };
-
-        return new MessageTrade
-        {
-            AccountId = execution.AccountHash,
-            TradeId = execution.ExecutionId,
-            SymbolId = execution.Symbol ?? string.Empty,
-            OrderId = execution.OrderId,
-            Price = execution.Price ?? 0d,
-            Quantity = execution.Quantity ?? 0d,
-            DateTime = execution.ExecutedTime?.UtcDateTime ?? DateTime.UtcNow,
-            Side = ResolveSide(execution.Instruction),
-            PositionImpactType = ConvertPositionImpactType(execution.PositionEffect),
-            GrossPnl = grossPnl,
-            Fee = fee,
-            NetPnl = net,
-            OrderTypeId = string.Empty,
-            PositionId = $"{execution.AccountHash}:{execution.Symbol}",
-            Comment = execution.ExecutionType ?? string.Empty
-        };
-    }
 
     private static OrderStatus ConvertOrderStatus(string? status) =>
         status?.ToUpperInvariant() switch
@@ -2988,75 +2753,6 @@ internal sealed class SchwabMarketDataVendor : Vendor
 
     private static string GetOrderKey(BrokerOrderDto order) => $"{order.AccountHash}:{order.OrderId}";
 
-    private static bool MatchesOrderHistoryRequest(BrokerOrderDto order, DateTime from, DateTime to, IEnumerable<string>? symbolIds)
-    {
-        if (string.IsNullOrWhiteSpace(order.Symbol))
-            return false;
-
-        if (!MatchesSymbolIds(order.Symbol, symbolIds))
-            return false;
-
-        var timestamp = order.CloseTime?.UtcDateTime ?? order.EnteredTime?.UtcDateTime ?? DateTime.MinValue;
-        if (from != default && timestamp < from)
-            return false;
-        if (to != default && timestamp > to)
-            return false;
-
-        return true;
-    }
-
-    private static bool MatchesTradesHistoryRequest(BrokerExecutionDto execution, DateTime from, DateTime to, IEnumerable<string>? symbolIds)
-    {
-        if (string.IsNullOrWhiteSpace(execution.Symbol))
-            return false;
-
-        if (!MatchesSymbolIds(execution.Symbol, symbolIds))
-            return false;
-
-        var timestamp = execution.ExecutedTime?.UtcDateTime ?? DateTime.MinValue;
-        if (from != default && timestamp < from)
-            return false;
-        if (to != default && timestamp > to)
-            return false;
-
-        return true;
-    }
-
-    private static bool MatchesSymbolIds(string symbol, IEnumerable<string>? symbolIds)
-    {
-        if (symbolIds == null)
-            return true;
-
-        var ids = symbolIds.Where(id => !string.IsNullOrWhiteSpace(id)).ToArray();
-        if (ids.Length == 0)
-            return true;
-
-        return ids.Any(id => string.Equals(id, symbol, StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static PositionImpactType ConvertPositionImpactType(string? positionEffect) =>
-        positionEffect?.ToUpperInvariant() switch
-        {
-            "OPENING" => PositionImpactType.Open,
-            "CLOSING" => PositionImpactType.Close,
-            _ => PositionImpactType.Undefined
-        };
-
-    private static PositionImpactType DerivePositionImpactType(string? instruction) =>
-        instruction?.ToUpperInvariant() switch
-        {
-            "BUY_TO_OPEN" => PositionImpactType.Open,
-            "SELL_TO_OPEN" => PositionImpactType.Open,
-            "BUY_TO_CLOSE" => PositionImpactType.Close,
-            "SELL_TO_CLOSE" => PositionImpactType.Close,
-            _ => PositionImpactType.Undefined
-        };
-
-    private static Side ResolveSide(string? instruction) =>
-        instruction?.StartsWith("BUY", StringComparison.OrdinalIgnoreCase) == true
-            ? Side.Buy
-            : Side.Sell;
-
     private static TimeInForce ConvertTimeInForce(string? duration) =>
         duration?.ToUpperInvariant() switch
         {
@@ -3078,37 +2774,16 @@ internal sealed class SchwabMarketDataVendor : Vendor
 
     private static string? BuildOrderComment(BrokerOrderDto order)
     {
-        var instructionComment = BuildInstructionComment(order.Instruction);
         if (string.Equals(order.Session, "SEAMLESS", StringComparison.OrdinalIgnoreCase))
-            return CombineComments(instructionComment, "Extended hours");
+            return "Extended hours";
 
         if (string.Equals(order.Session, "AM", StringComparison.OrdinalIgnoreCase))
-            return CombineComments(instructionComment, "AM session");
+            return "AM session";
 
         if (string.Equals(order.Session, "PM", StringComparison.OrdinalIgnoreCase))
-            return CombineComments(instructionComment, "PM session");
+            return "PM session";
 
-        return instructionComment;
-    }
-
-    private static string? BuildInstructionComment(string? instruction) =>
-        instruction?.ToUpperInvariant() switch
-        {
-            "BUY_TO_OPEN" => "Buy to open",
-            "BUY_TO_CLOSE" => "Buy to close",
-            "SELL_TO_OPEN" => "Sell to open",
-            "SELL_TO_CLOSE" => "Sell to close",
-            _ => null
-        };
-
-    private static string? CombineComments(string? first, string? second)
-    {
-        if (string.IsNullOrWhiteSpace(first))
-            return second;
-        if (string.IsNullOrWhiteSpace(second))
-            return first;
-
-        return $"{first} | {second}";
+        return null;
     }
 
     private static string? ResolveOptimisticSession(TimeInForce timeInForce, string? currentSession)
@@ -3122,87 +2797,9 @@ internal sealed class SchwabMarketDataVendor : Vendor
         return currentSession;
     }
 
-    private void PrimeHistorySymbols(IEnumerable<string?> symbols)
-    {
-        lock (this.syncRoot)
-        {
-            foreach (var rawSymbol in symbols)
-            {
-                if (string.IsNullOrWhiteSpace(rawSymbol))
-                    continue;
-
-                var symbol = rawSymbol.Trim().ToUpperInvariant();
-                if (this.optionContractCache.ContainsKey(symbol))
-                    continue;
-
-                if (!TryParseOccOptionSymbol(symbol, out var parsed))
-                    continue;
-
-                var contract = new OptionContractDto
-                {
-                    Symbol = symbol,
-                    UnderlierSymbol = parsed.Underlier,
-                    Description = $"{parsed.Underlier} {parsed.ExpirationDate:yyyy-MM-dd} {(parsed.OptionType == "PUT" ? "Put" : "Call")} {parsed.StrikePrice:0.##}",
-                    Exchange = OptionExchangeId,
-                    OptionType = parsed.OptionType,
-                    StrikePrice = parsed.StrikePrice,
-                    ExpirationDate = parsed.ExpirationDate
-                };
-
-                this.CacheOptionContract(contract);
-            }
-        }
-    }
-
-    private static DateTime NormalizeHistoryBoundary(DateTime value, bool isUpperBound)
-    {
-        if (value == default)
-            return value;
-
-        if (isUpperBound && value.TimeOfDay == TimeSpan.Zero)
-            return value.Date.AddDays(1).AddTicks(-1);
-
-        return value;
-    }
-
-    private static bool TryParseOccOptionSymbol(string symbol, out ParsedOccOption parsed)
-    {
-        parsed = default!;
-        var trimmed = symbol.Trim().ToUpperInvariant();
-        if (trimmed.Length < 16)
-            return false;
-
-        var spaceIndex = trimmed.IndexOf(' ');
-        if (spaceIndex <= 0 || spaceIndex >= trimmed.Length - 15)
-            return false;
-
-        var underlier = trimmed[..spaceIndex].Trim();
-        var contractPart = trimmed[(spaceIndex + 1)..].Trim();
-        if (contractPart.Length != 15)
-            return false;
-
-        var datePart = contractPart[..6];
-        var optionType = contractPart[6];
-        var strikePart = contractPart[7..];
-
-        if (!DateTime.TryParseExact(datePart, "yyMMdd", null, System.Globalization.DateTimeStyles.None, out var expirationDate))
-            return false;
-
-        if (optionType is not ('C' or 'P'))
-            return false;
-
-        if (!int.TryParse(strikePart, out var strikeRaw))
-            return false;
-
-        parsed = new ParsedOccOption
-        {
-            Underlier = underlier,
-            ExpirationDate = expirationDate,
-            OptionType = optionType == 'P' ? "PUT" : "CALL",
-            StrikePrice = strikeRaw / 1000d
-        };
-        return true;
-    }
+    private static bool IsBuyInstruction(string? instruction) =>
+        string.Equals(instruction, "BUY", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(instruction, "BUY_TO_COVER", StringComparison.OrdinalIgnoreCase);
 
     private static BrokerOrderDto CreateOptimisticOrder(
         string accountHash,
@@ -3296,8 +2893,6 @@ internal sealed class SchwabMarketDataVendor : Vendor
 
     private sealed class CachedDomState
     {
-        private const double PriceTolerance = 0.0000001d;
-
         public DateTime TimestampUtc { get; init; }
 
         public bool IsRealBook { get; init; }
@@ -3331,89 +2926,6 @@ internal sealed class SchwabMarketDataVendor : Vendor
                     .ToList()
             };
 
-        public static CachedDomState MergeBookUpdate(CachedDomState? existing, DOMQuote dom, bool isRealBook)
-        {
-            var bidMap = existing?.Bids.ToDictionary(level => level.Price) ?? new Dictionary<double, CachedDomLevel>();
-            var askMap = existing?.Asks.ToDictionary(level => level.Price) ?? new Dictionary<double, CachedDomLevel>();
-
-            ApplyUpdates(
-                bidMap,
-                dom.Bids.Select(level => new CachedDomLevel
-                {
-                    Price = level.Price,
-                    Size = level.Size,
-                    NumberOrders = level.NumberOrders,
-                    Closed = level.Closed || level.Size <= 0
-                }));
-
-            ApplyUpdates(
-                askMap,
-                dom.Asks.Select(level => new CachedDomLevel
-                {
-                    Price = level.Price,
-                    Size = level.Size,
-                    NumberOrders = level.NumberOrders,
-                    Closed = level.Closed || level.Size <= 0
-                }));
-
-            return new CachedDomState
-            {
-                TimestampUtc = dom.Time,
-                IsRealBook = isRealBook || existing?.IsRealBook == true,
-                Bids = bidMap.Values.OrderByDescending(level => level.Price).ToList(),
-                Asks = askMap.Values.OrderBy(level => level.Price).ToList()
-            };
-        }
-
-        public static CachedDomState MergeVenueStates(IEnumerable<CachedDomState> states)
-        {
-            var stateList = states.ToList();
-            var bidMap = new Dictionary<double, CachedDomLevel>();
-            var askMap = new Dictionary<double, CachedDomLevel>();
-
-            foreach (var state in stateList)
-            {
-                MergeSide(bidMap, state.Bids);
-                MergeSide(askMap, state.Asks);
-            }
-
-            return new CachedDomState
-            {
-                TimestampUtc = stateList.Count == 0 ? DateTime.UtcNow : stateList.Max(state => state.TimestampUtc),
-                IsRealBook = stateList.Any(state => state.IsRealBook),
-                Bids = bidMap.Values.OrderByDescending(level => level.Price).ToList(),
-                Asks = askMap.Values.OrderBy(level => level.Price).ToList()
-            };
-        }
-
-        public static CachedDomState ClampToNbbo(CachedDomState state, double bestBid, double bestAsk)
-        {
-            var bids = state.Bids;
-            var asks = state.Asks;
-
-            if (bestBid > 0)
-            {
-                bids = bids
-                    .Where(level => level.Price <= bestBid + PriceTolerance)
-                    .ToList();
-            }
-
-            if (bestAsk > 0)
-            {
-                asks = asks
-                    .Where(level => level.Price >= bestAsk - PriceTolerance)
-                    .ToList();
-            }
-
-            return new CachedDomState
-            {
-                TimestampUtc = state.TimestampUtc,
-                IsRealBook = state.IsRealBook,
-                Bids = bids,
-                Asks = asks
-            };
-        }
-
         public DOMQuote ToDomQuote(string symbol)
         {
             var dom = new DOMQuote(symbol, this.TimestampUtc);
@@ -3437,46 +2949,9 @@ internal sealed class SchwabMarketDataVendor : Vendor
 
             return dom;
         }
-
-        private static void ApplyUpdates(Dictionary<double, CachedDomLevel> target, IEnumerable<CachedDomLevel> updates)
-        {
-            foreach (var update in updates)
-            {
-                if (update.Closed || update.Size <= 0)
-                {
-                    target.Remove(update.Price);
-                    continue;
-                }
-
-                target[update.Price] = update with { Closed = false };
-            }
-        }
-
-        private static void MergeSide(Dictionary<double, CachedDomLevel> target, IEnumerable<CachedDomLevel> levels)
-        {
-            foreach (var level in levels)
-            {
-                if (level.Closed || level.Size <= 0)
-                    continue;
-
-                if (target.TryGetValue(level.Price, out var existing))
-                {
-                    target[level.Price] = new CachedDomLevel
-                    {
-                        Price = level.Price,
-                        Size = existing.Size + level.Size,
-                        NumberOrders = existing.NumberOrders + level.NumberOrders,
-                        Closed = false
-                    };
-                    continue;
-                }
-
-                target[level.Price] = level with { Closed = false };
-            }
-        }
     }
 
-    private sealed record CachedDomLevel
+    private sealed class CachedDomLevel
     {
         public double Price { get; init; }
 
@@ -3485,16 +2960,5 @@ internal sealed class SchwabMarketDataVendor : Vendor
         public int NumberOrders { get; init; }
 
         public bool Closed { get; init; }
-    }
-
-    private sealed record ParsedOccOption
-    {
-        public string Underlier { get; init; } = string.Empty;
-
-        public DateTime ExpirationDate { get; init; }
-
-        public string OptionType { get; init; } = string.Empty;
-
-        public double StrikePrice { get; init; }
     }
 }

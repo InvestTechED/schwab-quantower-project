@@ -99,17 +99,11 @@ public sealed class SchwabVendor : Vendor
     public override IList<MessageOpenPosition> GetPositions(System.Threading.CancellationToken token) =>
         this.currentVendor?.GetPositions(token) ?? new List<MessageOpenPosition>();
 
-    public override IList<MessageOrderHistory> GetOrdersHistory(OrdersHistoryRequestParameters requestParameters) =>
-        this.currentVendor?.GetOrdersHistory(requestParameters) ?? new List<MessageOrderHistory>();
-
-    public override IList<MessageTrade> GetTrades(TradesHistoryRequestParameters requestParameters) =>
-        this.currentVendor?.GetTrades(requestParameters) ?? new List<MessageTrade>();
-
-    public override void GetTrades(TradesHistoryRequestParameters requestParameters, TradingPlatform.BusinessLayer.Integration.AccountTradesLoadingCallback callback) =>
-        this.currentVendor?.GetTrades(requestParameters, callback);
-
     public override TradesHistoryMetadata GetTradesMetadata() =>
         this.currentVendor?.GetTradesMetadata() ?? new TradesHistoryMetadata();
+
+    public override IList<MessageTrade> GetTrades(TradesHistoryRequestParameters parameters) =>
+        this.currentVendor?.GetTrades(parameters) ?? new List<MessageTrade>();
 
     public override PnL CalculatePnL(PnLRequestParameters parameters) =>
         this.currentVendor?.CalculatePnL(parameters) ?? base.CalculatePnL(parameters);
