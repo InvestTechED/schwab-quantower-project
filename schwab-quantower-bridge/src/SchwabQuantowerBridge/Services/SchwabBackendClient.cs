@@ -18,7 +18,9 @@ public sealed class SchwabBackendClient
     {
         this.httpClient = httpClient;
         this.settings = settings;
-        this.httpClient.Timeout = TimeSpan.FromSeconds(8);
+        // Schwab account/order calls can exceed 8 seconds during startup and after
+        // platform upgrades; keep the timeout long enough to avoid false connect cancels.
+        this.httpClient.Timeout = TimeSpan.FromSeconds(30);
     }
 
     public async Task<bool> PingAsync(CancellationToken cancellationToken = default)
