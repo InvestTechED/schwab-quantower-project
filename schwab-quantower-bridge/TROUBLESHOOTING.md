@@ -59,9 +59,6 @@ Healthy baseline:
 Correct bridge repo root:
 - `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge`
 
-Separate application, not the bridge runtime:
-- `D:\GitHub\Claude Code\schwab-quantower-project\schwab-equities-workstation`
-
 Live Quantower vendor bundle:
 - `D:\Quantower\TradingPlatform\v1.145.17\bin\Vendors\SchwabVendor`
 
@@ -76,6 +73,14 @@ Bridge token path:
 
 Bridge env path:
 - `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\.env`
+
+Quantower API reference from QT dev team:
+- `D:\Quantower\Quantower _ API Documentatation _ High Impact Classes.docx`
+- relevant classes to check before deep QT behavior changes:
+  - `DepthOfMarket`
+  - `HistoricalData`
+  - `Symbol`
+  - quote/last/mark/level2 processing methods
 
 ## Issue 01: QT Connected But No Data
 
@@ -183,8 +188,6 @@ Checks
   - `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\tokens\schwab_token.json`
 - confirm bridge root is correct:
   - `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge`
-- confirm the bridge is not trying to use files from:
-  - `D:\GitHub\Claude Code\schwab-quantower-project\schwab-equities-workstation`
 - confirm the failing endpoints really are auth-related:
 ```powershell
 Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:8000/api/market/snapshot/INTC'
@@ -363,32 +366,6 @@ Copy-Item 'D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridg
 
 Verification
 - live DLL timestamp or hash matches the built DLL
-
----
-
-## Issue 08: Wrong Runtime Path Or Project Confusion
-
-Symptoms
-- launchers point to the wrong folder
-- backend files appear under `schwab-equities-workstation`
-- bridge fails with missing token or missing backend files in unexpected places
-
-Meaning
-- bridge runtime path drifted away from the correct bridge repo
-
-Checks
-- verify launchers point to:
-  - `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge`
-
-Fix
-- keep bridge runtime in `schwab-quantower-bridge`
-- do not use `schwab-equities-workstation` as bridge runtime
-
-Verification
-- token, backend, `.env`, and launch scripts all resolve under the bridge repo
-
-Notes
-- `schwab-equities-workstation` is a separate app and should not hold bridge backend runtime files
 
 ---
 
@@ -1182,3 +1159,344 @@ Acceptance Check
 Notes
 - keep this issue separate from Issue 12 and Issue 15 because those cover vendor visibility / runtime deployment problems, while this issue covers a live connect-timeout problem after the vendor is already visible
 - the user reported a performance improvement after this timeout fix, so treat it as both a stability and startup-performance recovery
+
+---
+
+## Issue 16: DOM / Level II Ladder Drops Out Briefly Then Returns
+
+Symptoms
+- DOM and Level II windows briefly go blank or collapse, then return after about 1 to 2 seconds
+- the issue appears as missing ladder rows even though Schwab and QT are still connected
+- the `Realtime date/time` field continues advancing, which makes the drop look like a bridge/UI stability problem rather than a disconnected session
+- the drop can happen repeatedly and is not acceptable for trading because it makes the ladder visually unstable
+
+Meaning
+- Schwab data is still flowing, but the bridge was switching between real book state and fallback snapshot-derived DOM state
+- the Level II / DOM display was not being held stable once a real book existed
+- this caused visible flicker or temporary ladder loss even when the connection itself was still alive
+
+Checks
+- confirm QT and the bridge are both down before changing code
+- verify the DOM window is the one exhibiting the drop, not the chart itself
+- check whether the real book is present in the bridge runtime and then briefly replaced by snapshot DOM
+- inspect bridge logs for Level II / DOM refresh behavior and dropped events
+
+What Was Researched
+- traced DOM publishing inside `SchwabMarketDataVendor.cs`
+- traced the fallback path that publishes a snapshot-derived synthetic ladder when a real book is not considered fresh
+- confirmed the bridge had logic that could substitute snapshot DOM for a real book during freshness transitions
+- confirmed the bridge already caches DOM state and can replay it, but the fallback policy was still too permissive
+
+What Did Not Help
+- relying on the prior real-book freshness window alone
+- only increasing or decreasing the freshness timeout
+- treating the issue as a QT-only rendering problem
+- leaving the snapshot fallback path intact
+
+Root Cause
+- the bridge allowed snapshot-derived DOM to replace or supersede an existing real Level II book
+- once the real book aged past the freshness threshold, the bridge could temporarily publish a smaller synthetic ladder
+- that made the DOM appear to drop out and then return, even though the session was still live
+
+Fix
+- lock the real-book DOM path so that once a real Level II book exists for a symbol, the bridge keeps reusing it instead of falling back to snapshot DOM
+- remove the real-book freshness gate that was allowing a snapshot ladder to overwrite a live ladder
+- preserve the cached DOM until disconnect or unsubscribe clears it
+- apply the same behavior to both DOM and Level II windows so they remain consistent
+
+Implementation Notes
+- file updated:
+  - `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\src\SchwabQuantowerBridge\Quantower\SchwabMarketDataVendor.cs`
+- key behavior change:
+  - `PublishBestAvailableDom(...)` now prefers cached real DOM whenever it exists
+  - `PublishSnapshotDom(...)` no longer replaces a cached real DOM just because the real-book freshness window elapsed
+  - `realBookSeen` and `domCache` continue to act as the persistent bridge-side DOM memory until disconnect / unsubscribe
+- the fix was intentionally narrow so it does not touch chart streaming, quote streaming, or order handling
+
+Verification
+- rebuilt the bridge successfully with `dotnet build`
+- copied the rebuilt `SchwabVendor.dll` into:
+  - `D:\Quantower\TradingPlatform\v1.146.6\bin\Vendors\SchwabVendor\SchwabVendor.dll`
+- confirmed the build completed with `0 Error(s)`
+- expected runtime behavior after restart:
+  - real DOM / Level II should stay visible
+  - snapshot fallback should no longer blank or shrink the ladder once a real book is established
+
+Acceptance Check
+- DOM and Level II windows no longer blink out for a second or two
+- the ladder stays visually stable after the real book appears
+- QT does not need repeated manual refreshing to preserve the ladder
+- the bridge does not regress into snapshot DOM once a real Level II book has been established
+
+Notes
+- this issue is especially important because the user treats DOM stability as a hard trading requirement
+- if the ladder disappears again after this fix, the next check should be for a Schwab-side book entitlement or a stream handler failure, not a fallback from real book to snapshot ladder
+- QT and the bridge must be down before altering this code path in the future
+
+---
+
+## Issue 17: DOM Switch / Immediate Synthetic DOM Fallback Slows the App
+
+Symptoms
+- QT becomes dramatically slower after switching symbols from the Positions window or DOM symbol selector
+- the DOM takes a long time to update after clicking a position or ticker
+- the ladder may appear to stop moving or feel stuck while the bridge is busy
+- the slowdown can make the app feel much worse than the baseline before the enhancement
+
+Meaning
+- the bridge is doing extra work on every symbol switch
+- the new symbol is being forced through a local synthetic DOM fallback path before the normal live stream path can settle
+- the fallback is meant to help responsiveness, but in practice it caused redundant refresh pressure and made QT slower
+
+Checks
+- confirm QT and the bridge are both down before modifying the code
+- reproduce the issue by clicking a position and watching the DOM switch latency
+- verify whether the bridge is pushing an immediate DOM fallback before the live stream has established the symbol
+- watch the bridge logs for repeated snapshot / DOM refresh activity during symbol changes
+
+What Was Researched
+- traced the DOM subscribe path in `SchwabMarketDataVendor.cs`
+- traced the new immediate DOM fallback that was added for `Level2` symbol switches and symbol priming
+- confirmed that the fallback was intended to speed up display but instead introduced extra work on every symbol change
+- confirmed the bridge still had the normal live stream and cached DOM paths available without the fallback
+
+What Did Not Help
+- keeping the immediate synthetic DOM fallback enabled
+- trying to use the fallback as a universal fix for slow symbol switching
+- leaving the fallback in place and hoping QT would absorb the extra refresh pressure
+
+Root Cause
+- the bridge published an extra synthetic DOM immediately on `Level2` subscribe and on symbol priming
+- this added unnecessary work and caused QT to process more updates than needed during symbol switches
+- the effect was a major slowdown compared with the prior baseline
+
+Fix
+- remove the immediate synthetic DOM fallback from the subscribe / prime path
+- restore the previous faster behavior where the live stream and normal cached DOM logic handle the symbol switch
+- keep the change narrow so it does not touch quote streaming, chart streaming, or order handling
+
+Implementation Notes
+- file updated:
+  - `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\src\SchwabQuantowerBridge\Quantower\SchwabMarketDataVendor.cs`
+- behavior removed:
+  - `PublishImmediateDom(...)` helper
+  - immediate `Level2` DOM publish in `SubscribeSymbol(...)`
+  - immediate DOM publish in `PrimeRealtimeSymbol(...)`
+- the rollback was intentionally narrow so the bridge returns to the faster pre-regression path
+
+Verification
+- rebuilt the bridge successfully with `dotnet build`
+- copied the rebuilt `SchwabVendor.dll` into:
+  - `D:\Quantower\TradingPlatform\v1.146.6\bin\Vendors\SchwabVendor\SchwabVendor.dll`
+- confirmed the build completed with `0 Error(s)`
+
+Acceptance Check
+- switching symbols in the DOM should return to the prior fast behavior
+- clicking positions should no longer impose a long DOM update delay
+- the bridge should no longer flood QT with extra synthetic DOM work on symbol changes
+- the app should return to the pre-enhancement responsiveness baseline
+
+Notes
+- this issue should stay separate from the real-book stability fix because it is a performance regression caused by the immediate fallback path
+- do not reintroduce the immediate synthetic DOM fallback unless it is proven safe under load
+- QT and the bridge must be down before changing this code path again
+
+---
+
+## Issue 18: Clicking A Position Row Triggers Repeated Orders Refresh And Slows DOM Switch
+
+Symptoms
+- clicking a symbol in the Positions window can take 25 to 30 seconds before the DOM fully switches
+- the DOM symbol eventually changes, but QT feels blocked or sluggish during the switch
+- bridge logs show many repeated `GET /api/broker/orders` requests while the symbol click is happening
+- bridge logs also show multiple valid history requests for the clicked symbol across `1m`, `30m`, `1h`, `4h`, and `1d`
+- there may be no hard errors in the bridge log, but the UI still feels too slow
+
+Meaning
+- this is a performance bottleneck, not a bridge crash
+- QT is requesting several pieces of data on symbol switch, and the bridge was also re-hitting the backend for orders too often
+- the orders path was adding avoidable synchronous work during an already busy symbol-change sequence
+
+Checks
+- confirm QT and the bridge are both down before editing this path
+- reproduce by clicking a position row and watching bridge output
+- look for this pattern in the bridge log:
+  - repeated `GET /api/broker/orders HTTP/1.1`
+  - interleaved `GET /api/stream/status HTTP/1.1`
+  - many `GET /api/market/bars/<SYMBOL>?timeframe=...` calls for the same click
+- confirm the issue is lag under load, not an auth or stream failure
+
+What Was Researched
+- reviewed `GetPendingOrders(...)` in `SchwabMarketDataVendor.cs`
+- reviewed the bridge order polling loop and background order refresh path
+- compared the observed log pattern with the vendor implementation
+- confirmed that QT was repeatedly asking for pending orders during row clicks
+- confirmed `GetPendingOrders(...)` was making a fresh backend `GetOrdersAsync(...)` call instead of serving from the already-maintained vendor order cache
+
+What Did Not Help
+- treating the issue as a Schwab auth failure
+- treating the issue as a pure DOM-stream failure
+- assuming the slowdown was caused only by history requests
+- leaving `GetPendingOrders(...)` on direct backend fetch for every QT request
+
+Root Cause
+- on position-row clicks, QT legitimately requests several chart-history payloads for the selected symbol
+- during that same burst, the bridge was also making repeated synchronous backend calls for open orders
+- the vendor already maintains `orderCache` through order polling, but `GetPendingOrders(...)` was bypassing that cache and re-fetching orders directly
+- that unnecessary extra backend work increased row-click latency and made the DOM switch feel stalled
+
+Fix
+- keep the normal order polling loop in place
+- change `GetPendingOrders(...)` to serve from the vendor's fresh local order cache when the cache is recent
+- use a short cache-serve window so QT can request orders repeatedly during a row click without forcing repeated backend calls
+- only fall back to direct backend fetch when there is no usable cached order state yet
+- serialize backend order refreshes so multiple overlapping refresh triggers cannot stack and hammer the backend during one symbol switch
+- add a short minimum refresh interval so bursts of order-refresh requests collapse into one effective backend pull
+
+Implementation Notes
+- file updated:
+  - `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\src\SchwabQuantowerBridge\Quantower\SchwabMarketDataVendor.cs`
+- added:
+  - `PendingOrdersCacheServeWindow = 1500ms`
+  - `lastOrdersRefreshUtc`
+  - `GetCachedPendingOrders()`
+  - `OrderRefreshMinimumInterval = 750ms`
+  - `orderRefreshSemaphore`
+- updated:
+  - `GetPendingOrders(...)` now returns cached pending orders when the order cache is fresh or when the normal polling task is already active
+  - `RefreshOrdersAsync(...)` stamps `lastOrdersRefreshUtc` after successful backend refresh
+  - `RefreshOrdersAsync(...)` now skips refreshes inside the minimum interval and allows only one in-flight backend order refresh at a time
+
+Verification
+- code compiled after the change
+- bridge log should still show normal history requests for symbol switches, but the repeated `/api/broker/orders` flood should be materially reduced
+- DOM switch should feel faster because the vendor is no longer blocking on redundant order fetches during the click path
+- live DLL deployed to:
+  - `D:\Quantower\TradingPlatform\v1.146.6\bin\Vendors\SchwabVendor\SchwabVendor.dll`
+
+Acceptance Check
+- clicking a row in the Positions window should switch the DOM materially faster than before
+- the bridge should not spam repeated order-fetch calls during a single symbol switch
+- live orders should still update because the regular order polling loop remains active
+- this fix must not degrade chart streaming, DOM streaming, or backend stability
+
+2026-04-23 Recurrence / Regression Check
+- symptom returned as a smaller but still noticeable few-second lag when switching symbols from the Positions window into the DOM
+- user-provided log showed the same signature:
+  - legitimate `/api/market/bars/<SYMBOL>` bursts across multiple timeframes
+  - many `/api/market/snapshot/<SYMBOL>` calls
+  - repeated `/api/broker/orders` calls interleaved with the symbol-switch burst
+- re-checking source confirmed `GetPendingOrders(...)` had regressed back to direct synchronous backend `GetOrdersAsync(...)`
+- restored the narrow Issue 18 fix only:
+  - `GetPendingOrders(...)` serves from the local vendor `orderCache` while order polling is active or the cache is fresh
+  - `RefreshOrdersAsync(...)` uses a zero-wait semaphore so overlapping refresh triggers do not stack
+  - `RefreshOrdersAsync(...)` applies a short minimum refresh interval before hitting the backend again
+  - `lastOrdersRefreshUtc` is reset on disconnect
+- validation:
+  - `dotnet build .\src\SchwabQuantowerBridge\SchwabQuantowerBridge.csproj -c Release`
+  - build completed with `0 Error(s)`
+  - deployed rebuilt DLL/PDB to:
+    - `D:\Quantower\TradingPlatform\v1.146.6\bin\Vendors\SchwabVendor`
+  - backend health returned `200`
+  - stream status returned `200`
+- important scope note:
+  - do not suppress the normal `/api/market/bars/...` fan-out unless there is separate proof it is causing lag
+  - do not touch DOM book, Level II, snapshots, history, or startup behavior for this issue
+- live rollback note:
+  - after deploying the order-cache restore, the user reported worse live behavior:
+    - Level II windows flickering
+    - DOM symbol changed while linked charts stayed on the prior symbol
+    - Positions-window lag still present
+  - the order-cache patch was reverted immediately
+  - source diff for `SchwabMarketDataVendor.cs` was returned to the pre-patch state
+  - rebuilt and redeployed the reverted DLL/PDB to:
+    - `D:\Quantower\TradingPlatform\v1.146.6\bin\Vendors\SchwabVendor`
+  - backend health returned `200`
+  - stream status returned `200`
+  - do not reapply this order-cache patch as-is without a controlled diagnostic proving it will not affect QT live behavior
+
+Notes
+- this issue is separate from Issue 17
+- Issue 17 was caused by immediate synthetic DOM fallback pressure
+- Issue 18 is caused by redundant order-fetch pressure during row clicks
+- keep both issues documented because they are similar in symptom but different in root cause
+
+---
+
+## Issue 19: Experimental Symbol-Switch Optimizations Were Slower Than The GitHub Baseline
+
+Symptoms
+- clicking a row in the Positions window still felt slow after multiple bridge-side performance changes
+- QT charts could remain on the prior ticker or show "Data is loading..." while the DOM had already switched symbols
+- bridge logs showed large bursts of `/api/market/bars/<SYMBOL>` requests across multiple chart timeframes during symbol switches
+- the experimental version felt worse than the known GitHub baseline
+- reverting to the GitHub baseline version made the app feel better and more predictable
+
+Meaning
+- this was not an after-hours market-data issue
+- after-hours can make prints thinner, but it does not explain a 20 to 30 second row-click or grouped-chart symbol-switch delay
+- this was a bridge/QT interaction problem caused by local experimental changes layered on top of the GitHub baseline
+
+Checks
+- compare current local code to the GitHub baseline before making more changes:
+  - `git diff -- src/SchwabQuantowerBridge/Quantower/SchwabMarketDataVendor.cs`
+  - `git diff -- src/SchwabQuantowerBridge/Quantower/SchwabConnectionScaffold.cs`
+- inspect bridge logs during a row click and look for:
+  - repeated `/api/market/bars/<SYMBOL>` calls across `1m`, `30m`, `1h`, `4h`, and `1d`
+  - repeated `/api/broker/orders`
+  - websocket close/open cycles around symbol switches
+- confirm there are no auth failures, 429s, or backend crashes before blaming Schwab
+
+What Was Researched
+- compared the local working tree against the GitHub baseline
+- reviewed the Quantower API classes document, especially `HistoricalData`, `DepthOfMarket`, and `Core`
+- confirmed the classes document points toward event-driven historical-data / DOM behavior, not repeated bridge-side request suppression experiments
+- confirmed the local bridge had materially drifted from the GitHub baseline in `SchwabMarketDataVendor.cs`
+
+What Did Not Help
+- assuming the behavior was caused only by after-hours trading
+- layering multiple bridge-side optimizations without returning to a known-good baseline
+- treating every repeated history request as an error; QT legitimately requests multiple chart histories when grouped windows are linked
+- continuing to tune cache/throttle behavior after the user reported the GitHub baseline felt better
+
+Root Cause
+- the local bridge version had accumulated multiple performance experiments in the vendor layer
+- those changes interacted poorly with QT's grouped-window symbol-switch workflow
+- QT still requested several valid chart histories during symbol switches, but the experimental bridge changes made the UI feel worse than the GitHub baseline
+- the correct recovery step was to stop tuning the experimental branch and return the vendor logic to the known GitHub baseline
+
+Fix
+- revert the core Quantower vendor logic files back to the GitHub baseline:
+  - `src/SchwabQuantowerBridge/Quantower/SchwabMarketDataVendor.cs`
+  - `src/SchwabQuantowerBridge/Quantower/SchwabConnectionScaffold.cs`
+- keep the project reference updated for the installed Quantower version:
+  - `D:\Quantower\TradingPlatform\v1.146.6\bin\TradingPlatform.BusinessLayer.dll`
+  - `D:\Quantower\TradingPlatform\v1.146.6\bin\TradingPlatform.PresentationLayer.Plugins.dll`
+- rebuild the bridge
+- deploy the rebuilt baseline DLL to the live Quantower vendor folder
+
+Implementation Notes
+- commands used:
+  - `git restore --source=HEAD -- src/SchwabQuantowerBridge/Quantower/SchwabMarketDataVendor.cs src/SchwabQuantowerBridge/Quantower/SchwabConnectionScaffold.cs`
+  - `dotnet build .\src\SchwabQuantowerBridge\SchwabQuantowerBridge.csproj -c Release`
+- live DLL deployed to:
+  - `D:\Quantower\TradingPlatform\v1.146.6\bin\Vendors\SchwabVendor\SchwabVendor.dll`
+- the user confirmed the baseline version is better than the experimental version
+
+Verification
+- bridge rebuilt successfully with `0 Error(s)`
+- rebuilt DLL was copied into the live QT `v1.146.6` vendor folder
+- user restarted QT and the bridge and reported that the baseline version was better
+
+Acceptance Check
+- baseline should be the default recovery point when experimental performance changes degrade QT responsiveness
+- if symbol-switch lag remains on baseline, make only one narrow change at a time
+- do not reintroduce layered cache/throttle/order/DOM experiments together
+- preserve DOM, Level II, Positions, Orders, and chart stability over speculative performance changes
+
+Notes
+- keep this issue separate from Issue 17 and Issue 18
+- Issue 17 documents immediate synthetic DOM fallback pressure
+- Issue 18 documents redundant order-fetch pressure during row clicks
+- Issue 19 documents that the combined experimental local version was worse than the GitHub baseline and required rollback
+- future performance work should start from the baseline and target only one proven bottleneck at a time

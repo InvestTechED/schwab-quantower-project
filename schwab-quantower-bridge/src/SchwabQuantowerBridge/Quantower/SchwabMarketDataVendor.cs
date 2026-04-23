@@ -27,7 +27,6 @@ internal sealed class SchwabMarketDataVendor : Vendor
     private const int BackendHeartbeatFailureThreshold = 3;
     private static readonly TimeSpan MarketStatePulseInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan StreamStopDebounce = TimeSpan.FromSeconds(30);
-    private static readonly TimeSpan RealBookFreshnessWindow = TimeSpan.FromSeconds(15);
     private static readonly int[] ActionRefreshScheduleMilliseconds = [100, 600, 1500];
     private static readonly TimeSpan[] StreamReconnectBackoff = [TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5)];
     private static readonly bool VerboseDiagnosticsEnabled =
@@ -2258,8 +2257,7 @@ internal sealed class SchwabMarketDataVendor : Vendor
         lock (this.syncRoot)
         {
             if (this.domCache.TryGetValue(symbol, out var existing)
-                && existing.IsRealBook
-                && (DateTime.UtcNow - existing.TimestampUtc) <= RealBookFreshnessWindow)
+                && existing.IsRealBook)
                 return;
         }
 
@@ -2304,7 +2302,7 @@ internal sealed class SchwabMarketDataVendor : Vendor
 
     private void PublishBestAvailableDom(string symbol, MarketSnapshotDto snapshot)
     {
-        if (this.HasFreshRealBook(symbol))
+        if (this.HasRealBook(symbol))
         {
             this.PublishCachedDom(symbol);
             return;
@@ -2362,17 +2360,6 @@ internal sealed class SchwabMarketDataVendor : Vendor
         lock (this.syncRoot)
         {
             return this.domCache.TryGetValue(symbol, out dom);
-        }
-    }
-
-    private bool HasFreshRealBook(string symbol)
-    {
-        lock (this.syncRoot)
-        {
-            if (!this.domCache.TryGetValue(symbol, out var cached))
-                return false;
-
-            return cached.IsRealBook && (DateTime.UtcNow - cached.TimestampUtc) <= RealBookFreshnessWindow;
         }
     }
 
