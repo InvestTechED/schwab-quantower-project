@@ -1500,3 +1500,280 @@ Notes
 - Issue 18 documents redundant order-fetch pressure during row clicks
 - Issue 19 documents that the combined experimental local version was worse than the GitHub baseline and required rollback
 - future performance work should start from the baseline and target only one proven bottleneck at a time
+
+---
+
+## Issue 20: Schwab Order Accepted But Fill / Transaction Does Not Appear In QT
+
+Symptoms
+- QT shows `Place order request accepted`
+- Schwab/TOS shows the order in activity or filled-order history
+- QT does not show the order lifecycle update or transaction/fill after acceptance
+- the user may see only the accepted order id message, for example:
+  - `Order id: 1006108858538`
+- Positions may update later or only after a manual refresh/reconnect
+
+Meaning
+- the order submission path worked
+- Schwab accepted the order
+- the bridge did not complete the full Quantower order lifecycle after acceptance
+- this is different from a Schwab rejection, buying-power issue, token/auth failure, DOM/Level II issue, or chart issue
+
+Checks
+- confirm the order reached Schwab by checking:
+  - `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\backend\logs\schwab_trading_audit.jsonl`
+- look for:
+  - `"action": "place"`
+  - `"status_code": 201`
+  - `"order_id": "..."`
+  - Schwab preview `"status": "ACCEPTED"`
+- confirm backend endpoints are reachable when diagnosing live:
+```powershell
+Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:8000/api/broker/orders'
+Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:8000/api/broker/trades?lookback_days=1'
+Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:8000/api/broker/positions'
+```
+- if port `8000` is not listening, post-order refresh cannot update QT even if the order was submitted earlier
+
+What Was Researched
+- reviewed Quantower dev-team docs:
+  - `D:\Quantower\Quantower _ API Documentatation _ Business Objects _ Order Position Trade Only.docx`
+  - `D:\Quantower\Quantower _ API Documentatation _ Requests Classes.docx`
+- confirmed Quantower separates:
+  - `Order` / `MessageOpenOrder` for pending order state
+  - `Trade` / `MessageTrade` for executed fills
+  - `Position` / `MessageOpenPosition` for position updates after fills
+- confirmed `OrderRequestParameters` mapping was correct for submission
+- confirmed the missing piece was post-submit lifecycle publication, not initial order entry
+
+What Did Not Help
+- treating this as a DOM or Level II problem
+- treating this as a Schwab rejection after the audit log shows `status_code: 201`
+- reapplying the old Issue 18 order-cache optimization
+- relying only on `GetTrades(...)` history requests, because QT may not call trade history immediately after a live fill
+
+Root Cause
+- after `PlaceOrder(...)` succeeded, the bridge pushed an optimistic open order and scheduled normal order refreshes
+- the bridge could close terminal orders through `MessageCloseOrder`
+- however, it did not actively reconcile the accepted `order_id` against Schwab executions/trades and push `MessageTrade` when a fill appeared
+- QT therefore had an accepted order message, but not a reliable live transaction/fill message
+
+Fix
+- keep the existing order submission path unchanged
+- after Schwab returns an order id, start a short post-order lifecycle reconciliation loop for that specific order id
+- during that loop:
+  - refresh broker orders
+  - fetch broker trades/executions around the order submission time
+  - push `MessageTrade` for matching fills
+  - refresh and republish positions
+  - deduplicate pushed trade ids so fills are not duplicated in QT
+- keep the normal order polling loop in place
+
+Implementation Notes
+- file updated:
+  - `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\src\SchwabQuantowerBridge\Quantower\SchwabMarketDataVendor.cs`
+- added:
+  - `PostOrderLifecycleRefreshScheduleMilliseconds`
+  - `pushedTradeIds`
+  - `RefreshOrderLifecycleInBackground(...)`
+  - `RefreshTradesForOrderAsync(...)`
+  - `RefreshPositionsAsync(...)`
+- changed:
+  - `PlaceOrder(...)` now starts order-specific lifecycle reconciliation after receiving a Schwab order id
+- intentionally not changed:
+  - DOM
+  - Level II
+  - chart history
+  - market data streaming
+  - startup behavior
+  - previous Issue 18 order-cache optimization
+
+Verification
+- build command:
+```powershell
+dotnet build .\src\SchwabQuantowerBridge\SchwabQuantowerBridge.csproj -c Release
+```
+- build completed with:
+  - `0 Error(s)`
+- deployed rebuilt files to:
+  - `D:\Quantower\TradingPlatform\v1.146.6\bin\Vendors\SchwabVendor\SchwabVendor.dll`
+  - `D:\Quantower\TradingPlatform\v1.146.6\bin\Vendors\SchwabVendor\SchwabVendor.pdb`
+
+Acceptance Check
+- place a tiny controlled Schwab order from QT
+- QT should show the accepted order id
+- after Schwab fills the order, QT should receive a transaction/fill via `MessageTrade`
+- order should leave the Orders window when terminal
+- Positions should refresh after the fill
+- bridge debug log should include `PushTrade orderId=... tradeId=...`
+
+Notes
+- this fix depends on Schwab exposing execution/trade data quickly through `/api/broker/trades`
+- if Schwab delays execution visibility, QT may still update on the later reconciliation pass rather than instantly
+- if backend port `8000` is not listening after order placement, no bridge-side post-order refresh can complete
+- do not broaden this fix into order-cache throttling unless a separate controlled diagnostic proves it is safe
+
+---
+
+## Issue 21: QT Position Update Lags ToS After Schwab Fill Or Flatten
+
+Symptoms
+- ToS shows the Schwab position flattened or reduced
+- QT still shows the old Schwab position for a few more seconds
+- the final bridge state eventually becomes correct without a code restart
+- example:
+  - `ONDS` was sold in Schwab/ToS
+  - QT still showed the stale `ONDS` position temporarily
+
+Meaning
+- the bridge is eventually converging to the right Schwab position state
+- this is a sync-latency issue, not a persistent stale-cache corruption issue
+- QT is lagging the broker update rather than inventing a wrong long-term position
+
+Checks
+- confirm live bridge position state:
+```powershell
+Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:8000/api/broker/positions'
+```
+- inspect vendor debug log:
+```powershell
+Get-Content "$env:LOCALAPPDATA\SchwabQuantowerBridge\SchwabVendor.debug.log" -Tail 220
+```
+- look for:
+  - `PlaceOrder symbol=...`
+  - `PushTrade orderId=...`
+  - `Backend heartbeat failed ...`
+  - `OrderPolling error=... HttpClient.Timeout ...`
+
+What Was Researched
+- verified from live `/api/broker/positions` that the bridge eventually returned the correct flattened state after the user sold out of `ONDS`
+- reviewed the bridge polling design in:
+  - `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\src\SchwabQuantowerBridge\Quantower\SchwabMarketDataVendor.cs`
+- confirmed the bridge refreshes positions after order activity only on a bounded schedule:
+  - `100ms`
+  - `600ms`
+  - `1500ms`
+  - `3000ms`
+  - `6000ms`
+  - `10000ms`
+- confirmed there is no separate continuous low-latency position polling loop
+- confirmed logs also showed occasional backend friction:
+  - repeated `Backend heartbeat failed error=An error occurred while sending the request`
+  - one `OrderPolling error=The request was canceled due to the configured HttpClient.Timeout of 30 seconds elapsing.`
+
+What Did Not Help
+- treating the stale QT position as permanent corruption before checking live `/api/broker/positions`
+- assuming DOM or Level II code was responsible
+- assuming the stale position meant the final Schwab state was still wrong
+- proposing aggressive continuous position polling without considering latency/performance tradeoffs
+
+Root Cause
+- the bridge uses a short post-order position refresh burst rather than a continuous position-sync loop
+- if Schwab makes the final fill/position update visible after that refresh burst, QT can temporarily lag ToS
+- heartbeat/request slowdowns can stretch that lag further
+
+Fix
+- no code change was applied
+- this issue is currently treated as a known design limitation of the stable baseline
+- do not implement speculative continuous position polling unless the user explicitly approves the latency/performance tradeoff review first
+
+Verification
+- live `/api/broker/positions` no longer included `ONDS` after the sell
+- vendor log showed the `598` share `ONDS` sell was placed
+- final QT discrepancy resolved later without a bridge code change
+
+Acceptance Check
+- if QT lags ToS after a Schwab fill, first confirm whether `/api/broker/positions` has already converged
+- if `/api/broker/positions` is correct and QT catches up later, classify it as this issue
+- if `/api/broker/positions` remains stale for an extended period, open a new issue rather than reusing this one
+
+Notes
+- current intended post-order catch-up window is about `0` to `10` seconds
+- practical lag can exceed `10` seconds if Schwab reports the fill after that window or if backend requests are slow
+- this issue should stay separate from DOM/Level II performance work
+- preserve the low-latency market-data baseline unless a future experiment is explicitly approved
+
+---
+
+## Issue 22: QT Level II Shows Aggregated Ladder Instead Of Schwab Venue Rows
+
+Symptoms
+- ToS Active Trader Level II shows venue-specific rows for the same symbol
+- example venues in ToS:
+  - `OTCBB`
+  - `EDGX`
+  - `ARCA`
+  - `NSDQ`
+  - `BATS`
+- QT DOM/Level II shows a price ladder but less venue-level detail
+- market data is connected and updating, so this is not a token or backend availability issue
+
+What Was Researched
+- checked Quantower docs for Level II/DOM support:
+  - `Level2Item.MMID`
+  - `DetailedLevels`
+  - `GetMBOItems`
+  - `AggregateMethod`
+  - `LevelsCount`
+- checked Schwab stream book subscription support in the backend
+- confirmed the bridge already subscribes to:
+  - `nasdaq_book_subs`
+  - `nyse_book_subs`
+- confirmed the backend already registers:
+  - `add_nasdaq_book_handler(...)`
+  - `add_nyse_book_handler(...)`
+- checked schwab-py stream book field definitions
+- confirmed Schwab book payloads expose nested per-exchange rows:
+  - bid side: `EXCHANGE`, `BID_VOLUME`, `SEQUENCE`
+  - ask side: `EXCHANGE`, `ASK_VOLUME`, `SEQUENCE`
+
+What Did Not Help
+- changing account selection
+- restarting QT without changing the bridge mapping
+- assuming Schwab did not provide any venue detail
+- adding new polling loops
+- changing backend startup behavior
+- changing DOM or Level II subscription startup behavior
+
+Root Cause
+- the bridge subscribed to Schwab book feeds correctly
+- the bridge flattened each Schwab book level into one aggregate QT `Level2Quote`
+- nested Schwab per-exchange rows inside `BIDS` and `ASKS` were discarded before QT received them
+- QT therefore could not display the same venue-level detail ToS shows
+
+Fix
+- updated `SchwabMarketDataVendor.cs` to map nested Schwab per-exchange book rows into separate QT `Level2Quote` rows
+- preserved exchange/venue using QT `Level2Quote` broker/MMID-style metadata when available
+- preserved stable per-row ids using Schwab sequence/exchange/price/side data
+- retained aggregate fallback if Schwab sends no nested per-exchange rows
+- preserved cached DOM row id and broker metadata across cached replay
+- did not change:
+  - backend stream subscriptions
+  - startup behavior
+  - order routing
+  - account polling
+  - DOM/Level II polling cadence
+
+Verification
+- build command:
+```powershell
+dotnet build .\src\SchwabQuantowerBridge\SchwabQuantowerBridge.csproj -c Release
+```
+- build completed with:
+  - `0 Warning(s)`
+  - `0 Error(s)`
+- deployed rebuilt files to:
+  - `D:\Quantower\TradingPlatform\v1.146.6\bin\Vendors\SchwabVendor\SchwabVendor.dll`
+  - `D:\Quantower\TradingPlatform\v1.146.6\bin\Vendors\SchwabVendor\SchwabVendor.pdb`
+
+Acceptance Check
+- start bridge and QT
+- open INTC or another active symbol in QT DOM/Level II
+- compare against ToS Active Trader Level II
+- QT should receive per-exchange Schwab book rows instead of only one aggregate row per price level when Schwab provides nested venue data
+- if QT still visually aggregates rows by price, the next controlled diagnostic is the QT `LEVEL2_IS_AGGREGATED` rule; do not change that rule without a separate approval because it can affect DOM rendering behavior
+
+Notes
+- this is a bridge mapping fix, not a Schwab token fix
+- this does not guarantee QT will visually match ToS exactly because QT may still apply its own DOM aggregation/display rules
+- this fix gives QT the missing raw per-exchange rows so the platform has the data needed to display deeper venue detail

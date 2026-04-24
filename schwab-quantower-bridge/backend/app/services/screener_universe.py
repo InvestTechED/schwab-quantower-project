@@ -1,0 +1,15 @@
+SCREENING_UNIVERSE: tuple[str, ...] = (
+    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA", "AMD", "INTC",
+    "AVGO", "NFLX", "ORCL", "CRM", "ADBE", "QCOM", "CSCO", "TXN", "MU", "AMAT",
+    "ARM", "ANET", "VRT", "PLTR", "SNOW", "CRWD", "PANW", "MDB", "SHOP", "UBER",
+    "ABNB", "DASH", "RIVN", "SNAP", "HOOD", "SOFI", "ASTS", "RKLB", "APP", "NET",
+    "JPM", "BAC", "WFC", "C", "GS", "MS", "BLK", "SCHW", "AXP", "V",
+    "MA", "PYPL", "COF", "USB", "PNC", "BK", "TROW", "SPGI", "ICE", "KKR",
+    "XOM", "CVX", "COP", "EOG", "SLB", "MPC", "VLO", "OXY", "HAL", "PSX",
+    "LLY", "UNH", "JNJ", "ABBV", "MRK", "TMO", "DHR", "ISRG", "AMGN", "PFE",
+    "ABT", "SYK", "GILD", "CVS", "CAT", "DE", "GE", "RTX", "BA", "LMT",
+    "HON", "ETN", "NOC", "WM", "PCAR", "HD", "LOW", "COST", "WMT", "TGT",
+    "MCD", "SBUX", "CMG", "NKE", "BKNG", "PEP", "KO", "PG", "CL", "MO",
+    "PM", "DIS", "TMUS", "T", "VZ", "CMCSA", "CHTR", "SPY", "QQQ", "IWM",
+    "DIA", "XLF", "XLK", "XLE", "XLI", "XLV", "XLP", "XLY", "XLC", "XLU",
+)

@@ -157,25 +157,10 @@ public sealed class SchwabBackendClient
     }
 
     public async Task<BrokerOrderResultDto?> PlaceOrderAsync(
-        string accountHash,
-        string symbol,
-        double quantity,
-        string instruction,
-        string orderType,
-        double? limitPrice,
-        string? timeInForce,
+        PlaceBrokerOrderRequestDto request,
         CancellationToken cancellationToken = default)
     {
-        var body = JsonSerializer.Serialize(new
-        {
-            account_hash = accountHash,
-            symbol,
-            quantity,
-            instruction,
-            order_type = orderType,
-            limit_price = limitPrice,
-            time_in_force = timeInForce
-        }, JsonOptions);
+        var body = JsonSerializer.Serialize(request, JsonOptions);
 
         using var content = new StringContent(body, Encoding.UTF8, "application/json");
         using var response = await this.httpClient.PostAsync(

@@ -1,10 +1,12 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Net.WebSockets;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -28,6 +30,7 @@ internal sealed class SchwabMarketDataVendor : Vendor
     private static readonly TimeSpan MarketStatePulseInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan StreamStopDebounce = TimeSpan.FromSeconds(30);
     private static readonly int[] ActionRefreshScheduleMilliseconds = [100, 600, 1500];
+    private static readonly int[] PostOrderLifecycleRefreshScheduleMilliseconds = [100, 600, 1500, 3000, 6000, 10000];
     private static readonly TimeSpan[] StreamReconnectBackoff = [TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5)];
     private static readonly bool VerboseDiagnosticsEnabled =
         string.Equals(Environment.GetEnvironmentVariable("SCHWAB_BRIDGE_VERBOSE_DIAGNOSTICS"), "1", StringComparison.OrdinalIgnoreCase);
@@ -53,6 +56,7 @@ internal sealed class SchwabMarketDataVendor : Vendor
     private readonly Dictionary<string, string?> orderStatusCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, BrokerOrderDto> orderCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> closedOrderMessagesPushed = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> pushedTradeIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly object syncRoot = new();
     private SchwabBackendClient? backendClient;
     private CancellationTokenSource? orderPollingCancellation;
@@ -135,6 +139,7 @@ internal sealed class SchwabMarketDataVendor : Vendor
             this.primedSymbols.Clear();
             this.pendingSnapshotRefreshes.Clear();
             this.closedOrderMessagesPushed.Clear();
+            this.pushedTradeIds.Clear();
             this.connected = false;
             this.backendHealthy = false;
             this.backendPingTime = TimeSpan.Zero;
@@ -178,8 +183,8 @@ internal sealed class SchwabMarketDataVendor : Vendor
     {
         var rules = base.GetRules(token);
         rules.Add(new MessageRule { Name = Rule.ALLOW_TRADING, Value = true });
-        rules.Add(new MessageRule { Name = Rule.ALLOW_SL, Value = false });
-        rules.Add(new MessageRule { Name = Rule.ALLOW_TP, Value = false });
+        rules.Add(new MessageRule { Name = Rule.ALLOW_SL, Value = true });
+        rules.Add(new MessageRule { Name = Rule.ALLOW_TP, Value = true });
         rules.Add(new MessageRule { Name = Rule.ALLOW_MODIFY_ORDER, Value = true });
         rules.Add(new MessageRule { Name = Rule.ALLOW_MODIFY_PRICE, Value = true });
         rules.Add(new MessageRule { Name = Rule.ALLOW_MODIFY_AMOUNT, Value = true });
@@ -332,19 +337,14 @@ internal sealed class SchwabMarketDataVendor : Vendor
         try
         {
             var result = this.backendClient.PlaceOrderAsync(
-                    parameters.Account.Id,
-                    parameters.Symbol.Id,
-                    parameters.Quantity,
-                    instruction,
-                    "LIMIT",
-                    parameters.Price,
-                    ConvertTimeInForce(parameters.TimeInForce),
+                    BuildPlaceOrderRequest(parameters, instruction),
                     parameters.CancellationToken)
                 .GetAwaiter()
                 .GetResult();
 
             var orderId = result?.OrderId;
             if (!string.IsNullOrWhiteSpace(orderId))
+            {
                 this.PushOptimisticOpenOrder(CreateOptimisticOrder(
                     parameters.Account.Id,
                     orderId,
@@ -356,7 +356,13 @@ internal sealed class SchwabMarketDataVendor : Vendor
                     parameters.TimeInForce,
                     ResolveOptimisticSession(parameters.TimeInForce, null)));
 
-            this.RefreshOrdersInBackground();
+                this.RefreshOrderLifecycleInBackground(orderId, DateTime.UtcNow);
+            }
+            else
+            {
+                this.RefreshOrdersInBackground();
+            }
+
             return TradingOperationResult.CreateSuccess(parameters.RequestId, result?.OrderId);
         }
         catch (Exception ex)
@@ -382,6 +388,83 @@ internal sealed class SchwabMarketDataVendor : Vendor
             return signedPosition < 0 ? "BUY_TO_COVER" : "BUY";
 
         return signedPosition > 0 ? "SELL" : "SELL_SHORT";
+    }
+
+    public override TradingOperationResult ClosePosition(ClosePositionRequestParameters parameters)
+    {
+        if (this.backendClient == null)
+            return TradingOperationResult.CreateError(parameters.RequestId, "Schwab backend is not connected.");
+
+        try
+        {
+            var positions = this.backendClient.GetPositionsAsync(parameters.CancellationToken)
+                .GetAwaiter()
+                .GetResult();
+            this.MarkBackendSuccess();
+
+            var accountId = ResolveStringProperty(parameters, "Account") ?? ResolveStringProperty(parameters, "AccountId");
+            var positionId = ResolveStringProperty(parameters, "PositionId");
+            var symbolId = ResolveStringProperty(parameters, "Symbol") ?? ResolveStringProperty(parameters, "SymbolId");
+            var closeQuantity = ResolveDoubleProperty(parameters, "CloseQuantity");
+
+            var position = positions.FirstOrDefault(p =>
+                (string.IsNullOrWhiteSpace(accountId) || string.Equals(p.AccountHash, accountId, StringComparison.OrdinalIgnoreCase)) &&
+                ((string.IsNullOrWhiteSpace(positionId) || string.Equals($"{p.AccountHash}:{p.Symbol}", positionId, StringComparison.OrdinalIgnoreCase)) ||
+                 (!string.IsNullOrWhiteSpace(symbolId) && string.Equals(p.Symbol, symbolId, StringComparison.OrdinalIgnoreCase))));
+
+            if (position == null || string.IsNullOrWhiteSpace(position.Symbol) || Math.Abs(position.Quantity) <= 0)
+                return TradingOperationResult.CreateError(parameters.RequestId, "No matching Schwab position was found to close.");
+
+            var quantityToClose = closeQuantity > 0 ? Math.Min(Math.Abs(position.Quantity), closeQuantity) : Math.Abs(position.Quantity);
+            var instruction = position.Quantity > 0 ? "SELL" : "BUY_TO_COVER";
+
+            var result = this.backendClient.PlaceOrderAsync(
+                    new PlaceBrokerOrderRequestDto
+                    {
+                        AccountHash = position.AccountHash,
+                        Symbol = position.Symbol,
+                        Quantity = quantityToClose,
+                        Instruction = instruction,
+                        OrderType = "MARKET",
+                        TimeInForce = "DAY"
+                    },
+                    parameters.CancellationToken)
+                .GetAwaiter()
+                .GetResult();
+
+            this.RefreshOrdersInBackground();
+            return TradingOperationResult.CreateSuccess(parameters.RequestId, result?.OrderId);
+        }
+        catch (Exception ex)
+        {
+            return TradingOperationResult.CreateError(parameters.RequestId, ex.Message);
+        }
+    }
+
+    private PlaceBrokerOrderRequestDto BuildPlaceOrderRequest(PlaceOrderRequestParameters parameters, string instruction)
+    {
+        var protections = ResolveProtectionRequest(parameters);
+        var request = new PlaceBrokerOrderRequestDto
+        {
+            AccountHash = parameters.Account.Id,
+            Symbol = parameters.Symbol.Id,
+            Quantity = parameters.Quantity,
+            Instruction = instruction,
+            OrderType = "LIMIT",
+            LimitPrice = parameters.Price,
+            TimeInForce = ConvertTimeInForce(parameters.TimeInForce),
+            StopLossPrice = protections.StopLossPrice,
+            TakeProfitPrice = protections.TakeProfitPrice,
+            TrailingStopOffset = protections.TrailingStopOffset
+        };
+
+        LogDiagnostic(
+            $"PlaceOrder symbol={request.Symbol} side={parameters.Side} instruction={instruction} qty={request.Quantity} " +
+            $"limit={request.LimitPrice:0.####} tif={request.TimeInForce} stopLoss={FormatNullable(request.StopLossPrice)} " +
+            $"takeProfit={FormatNullable(request.TakeProfitPrice)} trailing={FormatNullable(request.TrailingStopOffset)} " +
+            $"protectionSource={protections.Source}");
+
+        return request;
     }
 
     public override TradingOperationResult CancelOrder(CancelOrderRequestParameters parameters)
@@ -918,6 +1001,35 @@ internal sealed class SchwabMarketDataVendor : Vendor
         }, token);
     }
 
+    private void RefreshOrderLifecycleInBackground(string orderId, DateTime submittedAtUtc)
+    {
+        if (!this.IsBackendOperational())
+            return;
+
+        var token = this.orderPollingCancellation?.Token ?? CancellationToken.None;
+        Task.Run(async () =>
+        {
+            try
+            {
+                foreach (var delay in PostOrderLifecycleRefreshScheduleMilliseconds)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(delay), token);
+                    await this.RefreshOrdersAsync(token);
+                    await this.RefreshTradesForOrderAsync(orderId, submittedAtUtc, token);
+                    await this.RefreshPositionsAsync(token);
+                }
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                Core.Instance.Loggers.Log(ex);
+                LogDiagnostic($"OrderLifecycleRefresh error orderId={orderId} error={ex.Message}");
+            }
+        }, token);
+    }
+
     private void StartBackendStatusPolling()
     {
         this.StopBackendStatusPolling();
@@ -1096,6 +1208,64 @@ internal sealed class SchwabMarketDataVendor : Vendor
         var orders = await client.GetOrdersAsync(token);
         this.MarkBackendSuccess();
         this.ReconcileOrderStatuses(orders, pushInitialTerminalCloses: true, pushActiveChanges: true);
+    }
+
+    private async Task RefreshTradesForOrderAsync(string orderId, DateTime submittedAtUtc, CancellationToken token)
+    {
+        var client = this.backendClient;
+        if (client == null)
+            return;
+
+        var from = submittedAtUtc.AddMinutes(-5);
+        var to = DateTime.UtcNow.AddMinutes(1);
+        var trades = await client.GetTradesAsync(from, to, token);
+        this.MarkBackendSuccess();
+
+        var tradeMessages = new List<MessageTrade>();
+        lock (this.syncRoot)
+        {
+            foreach (var trade in trades)
+            {
+                if (!string.Equals(trade.OrderId, orderId, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (string.IsNullOrWhiteSpace(trade.TradeId) ||
+                    string.IsNullOrWhiteSpace(trade.Symbol) ||
+                    trade.Quantity <= 0 ||
+                    trade.Price <= 0 ||
+                    !this.pushedTradeIds.Add(trade.TradeId))
+                    continue;
+
+                tradeMessages.Add(CreateTrade(trade));
+            }
+        }
+
+        foreach (var message in tradeMessages)
+        {
+            LogDiagnostic($"PushTrade orderId={orderId} tradeId={message.TradeId} symbol={message.SymbolId} quantity={message.Quantity} price={message.Price}");
+            this.PushMessage(message);
+        }
+    }
+
+    private async Task RefreshPositionsAsync(CancellationToken token)
+    {
+        var client = this.backendClient;
+        if (client == null)
+            return;
+
+        var positions = await client.GetPositionsAsync(token);
+        this.MarkBackendSuccess();
+
+        foreach (var position in positions)
+        {
+            if (string.IsNullOrWhiteSpace(position.Symbol) || Math.Abs(position.Quantity) <= 0)
+                continue;
+
+            if (position.MarketPrice is > 0)
+                this.SetLatestPrice(position.Symbol, position.MarketPrice.Value);
+
+            this.PushMessage(CreatePosition(position));
+        }
     }
 
     private void ReconcileOrderStatuses(
@@ -1660,11 +1830,27 @@ internal sealed class SchwabMarketDataVendor : Vendor
                 if (price <= 0)
                     continue;
 
-                dom.Bids.Add(new Level2Quote(QuotePriceType.Bid, symbol, $"B_{price:0.####}", price, size, timestamp)
+                if (!TryAddPerExchangeBookLevels(
+                        dom.Bids,
+                        QuotePriceType.Bid,
+                        symbol,
+                        price,
+                        timestamp,
+                        bid,
+                        "BIDS",
+                        "BID_VOLUME",
+                        "B"))
                 {
-                    Closed = size <= 0,
-                    NumberOrders = (int)GetDouble(bid, "NUM_BIDS")
-                });
+                    dom.Bids.Add(CreateLevel2Quote(
+                        QuotePriceType.Bid,
+                        symbol,
+                        $"B_{price:0.####}",
+                        price,
+                        size,
+                        timestamp,
+                        broker: null,
+                        numberOrders: (int)GetDouble(bid, "NUM_BIDS")));
+                }
             }
         }
 
@@ -1677,11 +1863,27 @@ internal sealed class SchwabMarketDataVendor : Vendor
                 if (price <= 0)
                     continue;
 
-                dom.Asks.Add(new Level2Quote(QuotePriceType.Ask, symbol, $"A_{price:0.####}", price, size, timestamp)
+                if (!TryAddPerExchangeBookLevels(
+                        dom.Asks,
+                        QuotePriceType.Ask,
+                        symbol,
+                        price,
+                        timestamp,
+                        ask,
+                        "ASKS",
+                        "ASK_VOLUME",
+                        "A"))
                 {
-                    Closed = size <= 0,
-                    NumberOrders = (int)GetDouble(ask, "NUM_ASKS")
-                });
+                    dom.Asks.Add(CreateLevel2Quote(
+                        QuotePriceType.Ask,
+                        symbol,
+                        $"A_{price:0.####}",
+                        price,
+                        size,
+                        timestamp,
+                        broker: null,
+                        numberOrders: (int)GetDouble(ask, "NUM_ASKS")));
+                }
             }
         }
 
@@ -2230,6 +2432,79 @@ internal sealed class SchwabMarketDataVendor : Vendor
         return null;
     }
 
+    private static bool TryAddPerExchangeBookLevels(
+        IList<Level2Quote> levels,
+        QuotePriceType priceType,
+        string symbol,
+        double price,
+        DateTime timestamp,
+        JsonElement aggregateLevel,
+        string nestedArrayName,
+        string volumeFieldName,
+        string idPrefix)
+    {
+        if (!aggregateLevel.TryGetProperty(nestedArrayName, out var perExchangeLevels) ||
+            perExchangeLevels.ValueKind != JsonValueKind.Array)
+            return false;
+
+        var added = false;
+        foreach (var perExchange in perExchangeLevels.EnumerateArray())
+        {
+            var exchange = GetString(perExchange, "EXCHANGE");
+            var size = GetDouble(perExchange, volumeFieldName);
+            if (string.IsNullOrWhiteSpace(exchange) || size <= 0)
+                continue;
+
+            var sequence = GetDouble(perExchange, "SEQUENCE");
+            var id = sequence > 0
+                ? $"{idPrefix}_{price:0.####}_{exchange}_{sequence:0}"
+                : $"{idPrefix}_{price:0.####}_{exchange}";
+
+            levels.Add(CreateLevel2Quote(
+                priceType,
+                symbol,
+                id,
+                price,
+                size,
+                timestamp,
+                exchange,
+                numberOrders: 0));
+            added = true;
+        }
+
+        return added;
+    }
+
+    private static Level2Quote CreateLevel2Quote(
+        QuotePriceType priceType,
+        string symbol,
+        string id,
+        double price,
+        double size,
+        DateTime timestamp,
+        string? broker,
+        int numberOrders)
+    {
+        var quote = new Level2Quote(priceType, symbol, id, price, size, timestamp)
+        {
+            Closed = size <= 0,
+            NumberOrders = numberOrders
+        };
+
+        if (!string.IsNullOrWhiteSpace(broker))
+            TrySetProperty(quote, "Broker", broker);
+
+        return quote;
+    }
+
+    private static string? GetString(JsonElement payload, string propertyName)
+    {
+        if (!payload.TryGetProperty(propertyName, out var value))
+            return null;
+
+        return value.ValueKind == JsonValueKind.String ? value.GetString() : value.ToString();
+    }
+
     private void PublishSnapshotDom(MarketSnapshotDto snapshot) =>
         this.PublishSyntheticDom(
             snapshot.Symbol,
@@ -2264,18 +2539,28 @@ internal sealed class SchwabMarketDataVendor : Vendor
         var dom = new DOMQuote(symbol, timestamp);
         if (resolvedBid > 0)
         {
-            dom.Bids.Add(new Level2Quote(QuotePriceType.Bid, symbol, $"B_{resolvedBid:0.####}", resolvedBid, bidSize, timestamp)
-            {
-                Closed = bidSize <= 0
-            });
+            dom.Bids.Add(CreateLevel2Quote(
+                QuotePriceType.Bid,
+                symbol,
+                $"B_{resolvedBid:0.####}",
+                resolvedBid,
+                bidSize,
+                timestamp,
+                broker: null,
+                numberOrders: 0));
         }
 
         if (resolvedAsk > 0)
         {
-            dom.Asks.Add(new Level2Quote(QuotePriceType.Ask, symbol, $"A_{resolvedAsk:0.####}", resolvedAsk, askSize, timestamp)
-            {
-                Closed = askSize <= 0
-            });
+            dom.Asks.Add(CreateLevel2Quote(
+                QuotePriceType.Ask,
+                symbol,
+                $"A_{resolvedAsk:0.####}",
+                resolvedAsk,
+                askSize,
+                timestamp,
+                broker: null,
+                numberOrders: 0));
         }
 
         lock (this.syncRoot)
@@ -2676,11 +2961,22 @@ internal sealed class SchwabMarketDataVendor : Vendor
             Comment = BuildOrderComment(order)
         };
 
+        TrySetProperty(message, "AverageFillPrice", order.AverageFillPrice);
+        TrySetProperty(message, "FilledQuantity", order.FilledQuantity);
+        TrySetProperty(message, "RemainingQuantity", order.RemainingQuantity);
+        TrySetProperty(message, "ExpirationTime", order.ExpirationTime?.UtcDateTime);
+        TrySetProperty(message, "OriginalStatus", order.OriginalStatus);
+        TrySetProperty(message, "PositionId", order.PositionId);
+        TrySetProperty(message, "GroupId", order.GroupId);
+        TrySetProperty(message, "TriggerPrice", order.TriggerPrice);
+        TrySetProperty(message, "TrailOffset", order.TrailOffset);
+
         return message;
     }
 
-    private static MessageTrade CreateTrade(BrokerTradeDto trade) =>
-        new()
+    private static MessageTrade CreateTrade(BrokerTradeDto trade)
+    {
+        var message = new MessageTrade
         {
             TradeId = trade.TradeId,
             SymbolId = trade.Symbol,
@@ -2692,6 +2988,19 @@ internal sealed class SchwabMarketDataVendor : Vendor
             OrderId = trade.OrderId ?? string.Empty,
             OrderTypeId = OrderType.Limit
         };
+        TrySetProperty(message, "PositionId", trade.PositionId);
+
+        if (trade.Fees is double fees)
+            TrySetProperty(message, "Fee", CreateUsdPnlItem(-Math.Abs(fees)));
+
+        if (trade.GrossAmount is double gross)
+            TrySetProperty(message, "GrossPnl", CreateUsdPnlItem(gross));
+
+        if (trade.NetAmount is double net)
+            TrySetProperty(message, "NetPnl", CreateUsdPnlItem(net));
+
+        return message;
+    }
 
     private static OrderStatus ConvertOrderStatus(string? status) =>
         status?.ToUpperInvariant() switch
@@ -2772,6 +3081,164 @@ internal sealed class SchwabMarketDataVendor : Vendor
 
         return null;
     }
+
+    private static PnLItem CreateUsdPnlItem(double value) => new()
+    {
+        AssetID = "USD",
+        Value = value
+    };
+
+    private static string? ResolveLevel2Broker(Level2Quote quote)
+    {
+        var property = quote.GetType().GetProperty("Broker", BindingFlags.Instance | BindingFlags.Public);
+        return property?.GetValue(quote) as string;
+    }
+
+    private static void TrySetProperty(object target, string propertyName, object? value)
+    {
+        if (value == null)
+            return;
+
+        var property = target.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
+        if (property == null || !property.CanWrite)
+            return;
+
+        try
+        {
+            var targetType = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
+            var converted = value;
+            if (value.GetType() != targetType && targetType != typeof(object))
+                converted = Convert.ChangeType(value, targetType);
+
+            property.SetValue(target, converted);
+        }
+        catch
+        {
+        }
+    }
+
+    private static ProtectionRequest ResolveProtectionRequest(PlaceOrderRequestParameters parameters)
+    {
+        var sourceParts = new List<string>();
+        var stopLossHolder = ResolveProtectionHolder(parameters, "StopLoss", "StopLossItems", sourceParts);
+        var takeProfitHolder = ResolveProtectionHolder(parameters, "TakeProfit", "TakeProfitItems", sourceParts);
+
+        var trailingStopOffset = ResolvePositiveDoubleProperty(parameters, "TrailOffset");
+        if (trailingStopOffset.HasValue)
+            sourceParts.Add("TrailOffset");
+
+        if (!trailingStopOffset.HasValue && stopLossHolder != null)
+        {
+            trailingStopOffset = ResolvePositiveDoubleProperty(stopLossHolder, "TrailOffset");
+            if (trailingStopOffset.HasValue)
+                sourceParts.Add("StopLoss.TrailOffset");
+        }
+
+        var stopLossPrice = trailingStopOffset.HasValue
+            ? null
+            : ResolvePositiveDoubleProperty(stopLossHolder, "Price");
+        if (stopLossPrice.HasValue)
+            sourceParts.Add("StopLoss.Price");
+
+        var takeProfitPrice = ResolvePositiveDoubleProperty(takeProfitHolder, "Price");
+        if (takeProfitPrice.HasValue)
+            sourceParts.Add("TakeProfit.Price");
+
+        return new ProtectionRequest(
+            stopLossPrice,
+            takeProfitPrice,
+            trailingStopOffset,
+            sourceParts.Count > 0 ? string.Join(",", sourceParts.Distinct(StringComparer.OrdinalIgnoreCase)) : "none");
+    }
+
+    private static object? ResolveProtectionHolder(object parameters, string holderPropertyName, string itemsPropertyName, List<string> sourceParts)
+    {
+        var holderProperty = parameters.GetType().GetProperty(holderPropertyName, BindingFlags.Instance | BindingFlags.Public);
+        var holder = holderProperty?.GetValue(parameters);
+        if (holder != null)
+        {
+            sourceParts.Add(holderPropertyName);
+            return holder;
+        }
+
+        var itemsProperty = parameters.GetType().GetProperty(itemsPropertyName, BindingFlags.Instance | BindingFlags.Public);
+        var items = itemsProperty?.GetValue(parameters);
+        if (items is not IEnumerable enumerable)
+            return null;
+
+        foreach (var item in enumerable)
+        {
+            if (item == null)
+                continue;
+
+            sourceParts.Add(itemsPropertyName);
+            return item;
+        }
+
+        return null;
+    }
+
+    private static double? ResolvePositiveDoubleProperty(object? target, string propertyName)
+    {
+        if (target == null)
+            return null;
+
+        var value = ResolveDoubleProperty(target, propertyName);
+        return value > 0 ? value : null;
+    }
+
+    private static double? TryResolveProtectionPrice(object parameters, string propertyName)
+    {
+        var property = parameters.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
+        var holder = property?.GetValue(parameters);
+        if (holder == null)
+            return null;
+
+        return ResolvePositiveDoubleProperty(holder, "Price");
+    }
+
+    private static string FormatNullable(double? value)
+        => value.HasValue ? value.Value.ToString("0.####") : "null";
+
+    private static string? ResolveStringProperty(object target, string propertyName)
+    {
+        var property = target.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
+        var value = property?.GetValue(target);
+        if (value == null)
+            return null;
+
+        return value switch
+        {
+            string text => text,
+            Account account => account.Id,
+            Symbol symbol => symbol.Id,
+            _ => ResolveStringProperty(value, "Id")
+        };
+    }
+
+    private static double ResolveDoubleProperty(object target, string propertyName)
+    {
+        var property = target.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
+        var value = property?.GetValue(target);
+        if (value == null)
+            return 0d;
+
+        return value switch
+        {
+            double d => d,
+            float f => f,
+            decimal m => (double)m,
+            int i => i,
+            long l => l,
+            _ => 0d
+        };
+    }
+
+    private sealed record ProtectionRequest(
+        double? StopLossPrice,
+        double? TakeProfitPrice,
+        double? TrailingStopOffset,
+        string Source);
 
     private static string? ResolveOptimisticSession(TimeInForce timeInForce, string? currentSession)
     {
@@ -2896,6 +3363,8 @@ internal sealed class SchwabMarketDataVendor : Vendor
                 Bids = dom.Bids
                     .Select(level => new CachedDomLevel
                     {
+                        Id = level.Id,
+                        Broker = ResolveLevel2Broker(level),
                         Price = level.Price,
                         Size = level.Size,
                         NumberOrders = level.NumberOrders,
@@ -2905,6 +3374,8 @@ internal sealed class SchwabMarketDataVendor : Vendor
                 Asks = dom.Asks
                     .Select(level => new CachedDomLevel
                     {
+                        Id = level.Id,
+                        Broker = ResolveLevel2Broker(level),
                         Price = level.Price,
                         Size = level.Size,
                         NumberOrders = level.NumberOrders,
@@ -2918,20 +3389,28 @@ internal sealed class SchwabMarketDataVendor : Vendor
             var dom = new DOMQuote(symbol, this.TimestampUtc);
             foreach (var bid in this.Bids)
             {
-                dom.Bids.Add(new Level2Quote(QuotePriceType.Bid, symbol, $"B_{bid.Price:0.####}", bid.Price, bid.Size, this.TimestampUtc)
-                {
-                    Closed = bid.Closed,
-                    NumberOrders = bid.NumberOrders
-                });
+                dom.Bids.Add(CreateLevel2Quote(
+                    QuotePriceType.Bid,
+                    symbol,
+                    bid.Id ?? $"B_{bid.Price:0.####}",
+                    bid.Price,
+                    bid.Size,
+                    this.TimestampUtc,
+                    bid.Broker,
+                    bid.NumberOrders));
             }
 
             foreach (var ask in this.Asks)
             {
-                dom.Asks.Add(new Level2Quote(QuotePriceType.Ask, symbol, $"A_{ask.Price:0.####}", ask.Price, ask.Size, this.TimestampUtc)
-                {
-                    Closed = ask.Closed,
-                    NumberOrders = ask.NumberOrders
-                });
+                dom.Asks.Add(CreateLevel2Quote(
+                    QuotePriceType.Ask,
+                    symbol,
+                    ask.Id ?? $"A_{ask.Price:0.####}",
+                    ask.Price,
+                    ask.Size,
+                    this.TimestampUtc,
+                    ask.Broker,
+                    ask.NumberOrders));
             }
 
             return dom;
@@ -2940,6 +3419,10 @@ internal sealed class SchwabMarketDataVendor : Vendor
 
     private sealed class CachedDomLevel
     {
+        public string? Id { get; init; }
+
+        public string? Broker { get; init; }
+
         public double Price { get; init; }
 
         public double Size { get; init; }

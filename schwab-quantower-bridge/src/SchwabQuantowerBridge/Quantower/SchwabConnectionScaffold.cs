@@ -117,5 +117,8 @@ public sealed class SchwabVendor : Vendor
     public override TradingOperationResult CancelOrder(CancelOrderRequestParameters request) =>
         this.currentVendor?.CancelOrder(request) ?? TradingOperationResult.CreateError(request.RequestId, "Schwab bridge is not connected.");
 
+    public override TradingOperationResult ClosePosition(ClosePositionRequestParameters request) =>
+        this.currentVendor?.ClosePosition(request) ?? TradingOperationResult.CreateError(request.RequestId, "Schwab bridge is not connected.");
+
     private void CurrentVendor_NewMessage(object? sender, VendorEventArgs e) => this.PushMessage(e.Message);
 }

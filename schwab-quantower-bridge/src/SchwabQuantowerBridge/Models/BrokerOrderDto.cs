@@ -20,8 +20,14 @@ public sealed class BrokerOrderDto
     [JsonPropertyName("order_type")]
     public string? OrderType { get; set; }
 
+    [JsonPropertyName("order_strategy_type")]
+    public string? OrderStrategyType { get; set; }
+
     [JsonPropertyName("status")]
     public string? Status { get; set; }
+
+    [JsonPropertyName("original_status")]
+    public string? OriginalStatus { get; set; }
 
     [JsonPropertyName("duration")]
     public string? Duration { get; set; }
@@ -34,6 +40,9 @@ public sealed class BrokerOrderDto
 
     [JsonPropertyName("close_time")]
     public DateTimeOffset? CloseTime { get; set; }
+
+    [JsonPropertyName("expiration_time")]
+    public DateTimeOffset? ExpirationTime { get; set; }
 
     [JsonPropertyName("quantity")]
     public double? Quantity { get; set; }
@@ -49,4 +58,19 @@ public sealed class BrokerOrderDto
 
     [JsonPropertyName("price")]
     public double? Price { get; set; }
+
+    [JsonPropertyName("stop_price")]
+    public double? StopPrice { get; set; }
+
+    [JsonPropertyName("trail_offset")]
+    public double? TrailOffset { get; set; }
+
+    [JsonPropertyName("trigger_price")]
+    public double? TriggerPrice { get; set; }
+
+    [JsonPropertyName("position_id")]
+    public string? PositionId { get; set; }
+
+    [JsonPropertyName("group_id")]
+    public string? GroupId { get; set; }
 }

@@ -1,3 +1,10 @@
 src/SchwabQuantowerBridge/bin/
 src/SchwabQuantowerBridge/obj/
 src/SchwabQuantowerBridge/.vs/
+backend/**/__pycache__/
+backend/**/*.pyc
+backend/logs/
+backend/*.egg-info/
+*.bak-*
+*.out
+*.err

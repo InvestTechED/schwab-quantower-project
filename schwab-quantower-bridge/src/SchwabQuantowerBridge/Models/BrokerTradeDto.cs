@@ -28,4 +28,16 @@ public sealed class BrokerTradeDto
 
     [JsonPropertyName("executed_time")]
     public DateTimeOffset ExecutedTime { get; set; }
+
+    [JsonPropertyName("gross_amount")]
+    public double? GrossAmount { get; set; }
+
+    [JsonPropertyName("fees")]
+    public double? Fees { get; set; }
+
+    [JsonPropertyName("net_amount")]
+    public double? NetAmount { get; set; }
+
+    [JsonPropertyName("position_id")]
+    public string? PositionId { get; set; }
 }
