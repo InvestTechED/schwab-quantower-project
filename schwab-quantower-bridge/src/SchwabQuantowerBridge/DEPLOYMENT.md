@@ -13,7 +13,7 @@ Primary artifacts:
 
 Copy the built files to:
 
-`D:\Quantower\TradingPlatform\v1.146.4\bin\Vendors\SchwabVendor`
+`D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabVendor`
 
 If the folder does not exist, create it.
 

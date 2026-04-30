@@ -1777,3 +1777,140 @@ Notes
 - this is a bridge mapping fix, not a Schwab token fix
 - this does not guarantee QT will visually match ToS exactly because QT may still apply its own DOM aggregation/display rules
 - this fix gives QT the missing raw per-exchange rows so the platform has the data needed to display deeper venue detail
+
+## Issue 24 - Closed Schwab Position Still Shows In QT Positions Window
+
+Symptoms
+- a Schwab position is closed in ToS / Schwab
+- ToS shows the closing fill correctly
+- QT still shows the old position in the Positions panel
+- example seen on April 24, 2026:
+  - ToS showed `BUY +2 TO CLOSE` for `APLD  260424C00036000`
+  - QT still showed `Short APLD 260424C00036000 -2`
+
+Meaning
+- the Schwab/backend source of truth may already be correct
+- QT can still retain a stale position if the bridge only publishes currently open positions and never explicitly publishes that a previously known position is now closed
+- this is a QT position-state reconciliation problem, not a DOM, Level II, market-data, or token issue
+
+Checks
+- verify backend positions first:
+```powershell
+Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:8000/api/broker/positions'
+```
+- if the stale symbol is absent from `/api/broker/positions`, Schwab/backend no longer considers it open
+- verify recent orders:
+```powershell
+Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:8000/api/broker/orders'
+```
+- for the APLD case, `/api/broker/orders` showed:
+  - `status`: `FILLED`
+  - `instruction`: `BUY_TO_CLOSE`
+  - `symbol`: `APLD  260424C00036000`
+  - `filled_quantity`: `2`
+  - `position_id`: account hash plus exact option symbol
+
+What Was Researched
+- checked current bridge `GetPositions(...)`
+- checked current bridge `RefreshPositionsAsync(...)`
+- checked QT docs around:
+  - `MessageOpenPosition`
+  - `Position.UpdateByMessage(MessageOpenPosition)`
+  - `Core.PositionRemoved`
+- checked for a documented `MessageClosePosition` type in QT XML docs
+- checked reflection path, but direct reflection was blocked by missing `System.Runtime, Version=10.0.0.0` loader dependencies in the shell
+
+What Did Not Help
+- assuming Schwab was still reporting the position open
+- changing market-data / DOM / Level II behavior
+- adding more polling
+- changing backend startup behavior
+- treating this as a ToS/QT display timing issue only
+
+Root Cause
+- bridge returned and pushed open positions only
+- when Schwab stopped returning a closed position, the bridge skipped it entirely
+- QT never received an explicit close-position message for that position ID
+- QT could therefore keep displaying the last known `MessageOpenPosition` for that position ID
+- this was most visible for fully closed options positions
+
+Fix
+- updated `SchwabMarketDataVendor.cs`
+- added a small in-memory position cache keyed by `AccountHash:Symbol`
+- on every existing position refresh:
+  - publish current open positions as before
+  - compare current position IDs against the previous cache
+  - for any previously cached position missing from Schwab positions, publish QT `MessageClosePosition`
+- no new polling was added
+- DOM and Level II paths were not changed
+- market-data subscriptions were not changed
+
+Correction
+- do not publish `MessageOpenPosition` with `Quantity = 0`
+- QT may display that as an actual row with quantity `0`
+- do not synthesize a closed position from a terminal order fill price
+- using a closing fill as `OpenPrice` contaminates AVG P
+- use `MessageClosePosition` for row removal instead
+
+Verification
+- backend proof before fix:
+  - `/api/broker/positions` returned only open `INTC` and `FDD`
+  - stale `APLD  260424C00036000` was absent
+  - `/api/broker/orders` showed the filled `BUY_TO_CLOSE`
+- build command:
+```powershell
+dotnet build .\src\SchwabQuantowerBridge\SchwabQuantowerBridge.csproj -c Release
+```
+- build completed with:
+  - `0 Error(s)`
+  - existing XML-comment warnings only
+- deployed rebuilt files to:
+  - `D:\Quantower\TradingPlatform\v1.146.6\bin\Vendors\SchwabVendor\SchwabVendor.dll`
+  - `D:\Quantower\TradingPlatform\v1.146.6\bin\Vendors\SchwabVendor\SchwabVendor.pdb`
+
+Acceptance Check
+- start bridge and QT
+- connect Schwab
+- close a small test position or wait for a real full close
+- confirm `/api/broker/positions` no longer contains that exact symbol
+- confirm QT Positions removes the position after the normal order/position refresh cycle
+- debug log should show:
+```text
+PushClosedPosition positionId=...
+```
+
+Notes
+- this is intentionally low-latency safe:
+  - no new REST polling loop
+  - no per-tick position refresh
+  - no DOM/Level II changes
+  - only a tiny in-memory set/dictionary comparison during existing position refreshes
+- exact option-symbol spacing matters, for example `APLD  260424C00036000`
+- if QT still shows a stale position after this fix, check whether the live DLL was actually deployed and QT fully restarted
+
+## Issue 25: QT Upgrade To `v1.146.7` Removes Schwab From Connections
+
+Symptoms
+- Quantower updated to `v1.146.7`
+- Schwab disappeared from the Connections list while built-in vendors still appeared
+- installed runtime folder was:
+  - `D:\Quantower\TradingPlatform\v1.146.7`
+- live logs also showed Schwab auth failures:
+```text
+refresh_token_authentication_error
+unsupported_token_type: 400 Bad Request
+```
+
+Root Cause
+- the QT upgrade created a new runtime vendor folder without the custom Schwab vendor bundle
+- the bridge project still referenced QT `v1.146.6` assemblies
+- the auth error was a separate expired/invalid Schwab refresh-token problem; it does not explain Schwab missing from QT Connections
+
+Fix
+- updated project references to:
+  - `D:\Quantower\TradingPlatform\v1.146.7\bin\TradingPlatform.BusinessLayer.dll`
+  - `D:\Quantower\TradingPlatform\v1.146.7\bin\TradingPlatform.PresentationLayer.Plugins.dll`
+- updated the bridge deploy path to:
+  - `D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabVendor`
+- rebuild and copy the vendor bundle into the new QT runtime folder
+- re-run Schwab OAuth login if backend endpoints still return `refresh_token_authentication_error`

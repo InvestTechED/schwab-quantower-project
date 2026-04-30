@@ -56,6 +56,8 @@ internal sealed class SchwabMarketDataVendor : Vendor
     private readonly Dictionary<string, string?> orderStatusCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, BrokerOrderDto> orderCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> closedOrderMessagesPushed = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, BrokerPositionDto> positionCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> closedPositionMessagesPushed = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> pushedTradeIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly object syncRoot = new();
     private SchwabBackendClient? backendClient;
@@ -135,6 +137,8 @@ internal sealed class SchwabMarketDataVendor : Vendor
             this.pendingOptionHydrations.Clear();
             this.orderStatusCache.Clear();
             this.orderCache.Clear();
+            this.positionCache.Clear();
+            this.closedPositionMessagesPushed.Clear();
             this.realBookSeen.Clear();
             this.primedSymbols.Clear();
             this.pendingSnapshotRefreshes.Clear();
@@ -233,20 +237,7 @@ internal sealed class SchwabMarketDataVendor : Vendor
             .ToList();
         this.MarkBackendSuccess();
 
-        foreach (var position in positions)
-        {
-            if (string.IsNullOrWhiteSpace(position.Symbol))
-                continue;
-
-            this.PrimeRealtimeSymbol(position.Symbol);
-
-            if (position.MarketPrice is > 0)
-                this.SetLatestPrice(position.Symbol, position.MarketPrice.Value);
-        }
-
-        return positions
-            .Select(CreatePosition)
-            .ToList();
+        return this.ReconcilePositions(positions, out _);
     }
 
     public override IList<MessageOpenOrder> GetPendingOrders(CancellationToken token)
@@ -1256,16 +1247,64 @@ internal sealed class SchwabMarketDataVendor : Vendor
         var positions = await client.GetPositionsAsync(token);
         this.MarkBackendSuccess();
 
-        foreach (var position in positions)
+        var messages = this.ReconcilePositions(positions, out var closeMessages);
+
+        foreach (var message in messages)
         {
-            if (string.IsNullOrWhiteSpace(position.Symbol) || Math.Abs(position.Quantity) <= 0)
-                continue;
+            this.PushMessage(message);
+        }
+
+        foreach (var message in closeMessages)
+        {
+            this.PushMessage(message);
+        }
+    }
+
+    private List<MessageOpenPosition> ReconcilePositions(IReadOnlyList<BrokerPositionDto> positions, out List<MessageClosePosition> closeMessages)
+    {
+        var messages = new List<MessageOpenPosition>();
+        closeMessages = new List<MessageClosePosition>();
+        var currentPositionIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var openPositions = positions
+            .Where(p => !string.IsNullOrWhiteSpace(p.Symbol) && Math.Abs(p.Quantity) > 0)
+            .ToList();
+
+        foreach (var position in openPositions)
+        {
+            currentPositionIds.Add(GetPositionId(position));
+            this.PrimeRealtimeSymbol(position.Symbol);
 
             if (position.MarketPrice is > 0)
                 this.SetLatestPrice(position.Symbol, position.MarketPrice.Value);
-
-            this.PushMessage(CreatePosition(position));
         }
+
+        lock (this.syncRoot)
+        {
+            foreach (var position in openPositions)
+            {
+                var positionId = GetPositionId(position);
+                this.positionCache[positionId] = position;
+                this.closedPositionMessagesPushed.Remove(positionId);
+                messages.Add(CreatePosition(position));
+            }
+
+            foreach (var positionId in this.positionCache.Keys.ToList())
+            {
+                if (currentPositionIds.Contains(positionId))
+                    continue;
+
+                var stalePosition = this.positionCache[positionId];
+                this.positionCache.Remove(positionId);
+
+                if (this.closedPositionMessagesPushed.Add(positionId))
+                    closeMessages.Add(CreateClosedPositionMessage(positionId));
+            }
+        }
+
+        foreach (var message in closeMessages)
+            LogDiagnostic($"PushClosedPosition positionId={message.PositionId}");
+
+        return messages;
     }
 
     private void ReconcileOrderStatuses(
@@ -2941,6 +2980,8 @@ internal sealed class SchwabMarketDataVendor : Vendor
         return message;
     }
 
+    private static MessageClosePosition CreateClosedPositionMessage(string positionId) => new() { PositionId = positionId };
+
     private static MessageOpenOrder CreateOpenOrder(BrokerOrderDto order)
     {
         var message = new MessageOpenOrder(order.Symbol ?? string.Empty)
@@ -3048,6 +3089,13 @@ internal sealed class SchwabMarketDataVendor : Vendor
         ex.Message.Contains("not active", StringComparison.OrdinalIgnoreCase);
 
     private static string GetOrderKey(BrokerOrderDto order) => $"{order.AccountHash}:{order.OrderId}";
+
+    private static string GetPositionId(BrokerPositionDto position) => $"{position.AccountHash}:{position.Symbol}";
+
+    private static string GetPositionId(BrokerOrderDto order) =>
+        !string.IsNullOrWhiteSpace(order.PositionId)
+            ? order.PositionId
+            : $"{order.AccountHash}:{order.Symbol}";
 
     private static TimeInForce ConvertTimeInForce(string? duration) =>
         duration?.ToUpperInvariant() switch
@@ -3253,6 +3301,7 @@ internal sealed class SchwabMarketDataVendor : Vendor
 
     private static bool IsBuyInstruction(string? instruction) =>
         string.Equals(instruction, "BUY", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(instruction, "BUY_TO_CLOSE", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(instruction, "BUY_TO_COVER", StringComparison.OrdinalIgnoreCase);
 
     private static BrokerOrderDto CreateOptimisticOrder(
