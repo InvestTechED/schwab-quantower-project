@@ -1,6 +1,12 @@
 src/SchwabQuantowerBridge/bin/
 src/SchwabQuantowerBridge/obj/
 src/SchwabQuantowerBridge/.vs/
+src/SchwabQuantowerBridge.PosOnly/bin/
+src/SchwabQuantowerBridge.PosOnly/obj/
+src/SchwabQuantowerBridge.PosOnly/.vs/
+src/SCHTRD/bin/
+src/SCHTRD/obj/
+src/SCHTRD/.vs/
 backend/**/__pycache__/
 backend/**/*.pyc
 backend/logs/

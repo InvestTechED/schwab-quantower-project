@@ -35,7 +35,6 @@ from app.services.auth import SchwabAuthService
 class SchwabBrokerService:
     def __init__(self) -> None:
         self.auth_service = SchwabAuthService()
-        self._recent_order_fingerprints: dict[tuple[str, str, str, float, str, float | None], datetime] = {}
         self.audit_path = Path(__file__).resolve().parents[2] / "logs" / "schwab_trading_audit.jsonl"
 
     def _account_mappings(self, client) -> tuple[dict[str, str], dict[str, str]]:
@@ -127,12 +126,12 @@ class SchwabBrokerService:
             account_hash = securities_account.get("accountNumber")
             for position in securities_account.get("positions", []):
                 instrument = position.get("instrument", {})
+                quantity = _as_float(position.get("longQuantity")) - _as_float(position.get("shortQuantity"))
                 positions.append(
                     BrokerPosition(
                         account_hash=number_to_hash.get(str(account_hash), str(account_hash)),
                         symbol=instrument.get("symbol", "UNKNOWN"),
-                        quantity=_as_float(position.get("longQuantity"))
-                        - _as_float(position.get("shortQuantity")),
+                        quantity=quantity,
                         average_price=_as_float(position.get("averagePrice")),
                         market_value=_as_float(position.get("marketValue")),
                         market_price=_resolve_market_price(position),
@@ -141,7 +140,7 @@ class SchwabBrokerService:
                         description=instrument.get("description"),
                         day_profit_loss=_as_float(position.get("currentDayProfitLoss")),
                         day_profit_loss_percent=_as_float(position.get("currentDayProfitLossPercentage")),
-                        unrealized_profit_loss=_as_float(position.get("longOpenProfitLoss")),
+                        unrealized_profit_loss=_resolve_open_profit_loss(position, quantity),
                     )
                 )
 
@@ -280,7 +279,7 @@ class SchwabBrokerService:
     def preview_order(self, request: EquityOrderRequest) -> dict[str, object]:
         client = self.auth_service.create_client()
         account_hash = self._resolve_account_hash(client, request.account_hash)
-        self._validate_order_request(client, account_hash, request, enforce_duplicate=False)
+        self._validate_order_request(client, account_hash, request)
         order_spec = _build_equity_order(
             request,
             duration=_resolve_duration(request.time_in_force, None),
@@ -299,7 +298,7 @@ class SchwabBrokerService:
     def place_order(self, request: EquityOrderRequest) -> dict[str, object]:
         client = self.auth_service.create_client()
         account_hash = self._resolve_account_hash(client, request.account_hash)
-        self._validate_order_request(client, account_hash, request, enforce_duplicate=True)
+        self._validate_order_request(client, account_hash, request)
         order_spec = _build_equity_order(
             request,
             duration=_resolve_duration(request.time_in_force, None),
@@ -320,7 +319,6 @@ class SchwabBrokerService:
             "account_hash": account_hash,
             "order_id": str(order_id) if order_id is not None else None,
         }
-        self._remember_order(account_hash, request)
         self._audit("place", account_hash, request, {**result, "preview": preview_payload})
         return result
 
@@ -374,90 +372,40 @@ class SchwabBrokerService:
             raise ValueError(f"Order {order_id} was not found at Schwab")
         return order
 
-    def _validate_order_request(self, client, account_hash: str, request: EquityOrderRequest, enforce_duplicate: bool) -> None:
+    def _validate_order_request(self, client, account_hash: str, request: EquityOrderRequest) -> None:
         if not settings.schwab_trading_enabled:
             raise ValueError("Schwab trading kill switch is OFF. Set SCHWAB_TRADING_ENABLED=true and restart the backend to allow orders.")
 
-        if settings.schwab_max_order_shares > 0 and request.quantity > settings.schwab_max_order_shares:
-            raise ValueError(f"Order quantity {request.quantity} exceeds max {settings.schwab_max_order_shares} share(s)")
 
         if request.quantity != int(request.quantity):
             raise ValueError("Fractional share orders are disabled for Schwab bridge trading")
 
-        if request.order_type not in {"LIMIT", "MARKET"}:
-            raise ValueError("Only LIMIT and MARKET orders are enabled for Schwab bridge trading")
+        if request.order_type not in {"LIMIT", "MARKET", "STOP", "STOP_LIMIT"}:
+            raise ValueError("Only LIMIT, MARKET, STOP, and STOP_LIMIT orders are enabled for Schwab bridge trading")
 
-        if request.order_type == "LIMIT" and request.limit_price is None:
+        if request.order_type in {"LIMIT", "STOP_LIMIT"} and request.limit_price is None:
             raise ValueError("limit_price is required")
+
+        if request.order_type in {"STOP", "STOP_LIMIT"} and request.stop_price is None:
+            raise ValueError("stop_price is required")
 
         if request.stop_loss_price is not None and request.trailing_stop_offset is not None:
             raise ValueError("Use either stop_loss_price or trailing_stop_offset, not both")
 
-        if (
-            request.stop_loss_price is not None
-            or request.take_profit_price is not None
-            or request.trailing_stop_offset is not None
-        ) and request.instruction not in {"BUY", "SELL_SHORT"}:
-            raise ValueError("Attached SL/TP/trailing protections are supported only for opening BUY or SELL_SHORT orders")
 
-        notional = request.quantity * (request.limit_price or 0)
-        if request.order_type == "LIMIT" and settings.schwab_max_order_notional > 0 and notional > settings.schwab_max_order_notional:
-            raise ValueError(f"Order notional ${notional:.2f} exceeds max ${settings.schwab_max_order_notional:.2f}")
 
-        quote_response = client.get_quote(request.symbol.upper())
-        quote_response.raise_for_status()
-        quote_payload = quote_response.json().get(request.symbol.upper(), {})
-        quote = quote_payload.get("quote", {})
-        regular = quote_payload.get("regular", {})
-        last = float(regular.get("regularMarketLastPrice") or quote.get("lastPrice") or quote.get("mark") or 0)
-        if request.order_type == "LIMIT" and last > 0:
-            deviation_pct = abs(request.limit_price - last) / last * 100
-            if deviation_pct > settings.schwab_limit_price_max_deviation_pct:
-                raise ValueError(
-                    f"Limit price deviation {deviation_pct:.2f}% exceeds max {settings.schwab_limit_price_max_deviation_pct:.2f}% from last price {last:.2f}"
-                )
-
-        if enforce_duplicate and self._is_duplicate_order(account_hash, request):
-            raise ValueError("Duplicate order blocked by Schwab bridge duplicate-protection window")
 
     def _validate_modify_request(self, current_order: dict, request: ModifyEquityOrderRequest) -> None:
         status = str(current_order.get("status") or "")
         if not _is_active_order_status(status):
             raise ValueError(f"Order {request.order_id} is not active/cancelable and cannot be modified")
 
-        if str(current_order.get("orderType") or "").upper() != "LIMIT":
-            raise ValueError("Only LIMIT order modifications are supported in the Schwab bridge")
+        if str(current_order.get("orderType") or "").upper() not in {"LIMIT", "STOP", "STOP_LIMIT"}:
+            raise ValueError("Only LIMIT, STOP, and STOP_LIMIT order modifications are supported in the Schwab bridge")
 
         if request.quantity != int(request.quantity):
             raise ValueError("Fractional share modifications are disabled for Schwab bridge trading")
 
-        current_quantity = _as_float(current_order.get("quantity")) or 0.0
-        if (
-            settings.schwab_max_order_shares > 0
-            and request.quantity > current_quantity
-            and request.quantity > settings.schwab_max_order_shares
-        ):
-            raise ValueError(
-                f"Schwab bridge can only increase quantity up to {settings.schwab_max_order_shares:.0f} share(s) during QT-side modification"
-            )
-
-    def _fingerprint(self, account_hash: str, request: EquityOrderRequest) -> tuple[str, str, str, float, str, float | None]:
-        limit_price = round(request.limit_price, 4) if request.limit_price is not None else None
-        return (account_hash, request.symbol.upper(), request.instruction, request.quantity, request.order_type, limit_price)
-
-    def _is_duplicate_order(self, account_hash: str, request: EquityOrderRequest) -> bool:
-        now = datetime.now(timezone.utc)
-        fingerprint = self._fingerprint(account_hash, request)
-        self._recent_order_fingerprints = {
-            key: timestamp
-            for key, timestamp in self._recent_order_fingerprints.items()
-            if (now - timestamp).total_seconds() <= settings.schwab_duplicate_window_seconds
-        }
-        last_seen = self._recent_order_fingerprints.get(fingerprint)
-        return last_seen is not None and (now - last_seen).total_seconds() <= settings.schwab_duplicate_window_seconds
-
-    def _remember_order(self, account_hash: str, request: EquityOrderRequest) -> None:
-        self._recent_order_fingerprints[self._fingerprint(account_hash, request)] = datetime.now(timezone.utc)
 
     def _audit(self, action: str, account_hash: str, request: EquityOrderRequest | None, result: dict[str, object]) -> None:
         self.audit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -613,7 +561,33 @@ def _resolve_market_price(position: dict) -> float | None:
     if not quantity or not market_value:
         return None
 
-    return abs(market_value / quantity)
+    multiplier = 100.0 if _is_option_position(position) else 1.0
+    return abs(market_value / (quantity * multiplier))
+
+
+def _resolve_open_profit_loss(position: dict, quantity: float) -> float | None:
+    if quantity < 0:
+        value = _as_float(position.get("shortOpenProfitLoss"))
+        if value is not None:
+            return value
+
+    if quantity > 0:
+        value = _as_float(position.get("longOpenProfitLoss"))
+        if value is not None:
+            return value
+
+    return (
+        _as_float(position.get("longOpenProfitLoss"))
+        or _as_float(position.get("shortOpenProfitLoss"))
+    )
+
+
+def _is_option_position(position: dict) -> bool:
+    instrument = position.get("instrument", {})
+    return (
+        str(instrument.get("assetType") or "").upper() == "OPTION"
+        or str(instrument.get("type") or "").upper() == "VANILLA"
+    )
 
 
 def _build_equity_order(
@@ -636,12 +610,36 @@ def _build_equity_order(
     symbol = request.symbol.upper()
     quantity = request.quantity
 
-    if request.order_type == "LIMIT" and request.limit_price is None:
+    if request.order_type in {"LIMIT", "STOP_LIMIT"} and request.limit_price is None:
         raise ValueError("limit_price is required for LIMIT orders")
+
+    if request.order_type in {"STOP", "STOP_LIMIT"} and request.stop_price is None:
+        raise ValueError("stop_price is required for STOP orders")
 
     limit_price = None
     if request.limit_price is not None:
         limit_price = format(Decimal(str(request.limit_price)).quantize(Decimal("0.01")), "f")
+
+    if request.order_type == "STOP":
+        return _build_stop_exit_order(
+            symbol=symbol,
+            quantity=quantity,
+            instruction=request.instruction,
+            stop_price=request.stop_price,
+            duration=duration or Duration.DAY,
+            session=Session.NORMAL,
+        )
+
+    if request.order_type == "STOP_LIMIT":
+        return _build_stop_limit_exit_order(
+            symbol=symbol,
+            quantity=quantity,
+            instruction=request.instruction,
+            stop_price=request.stop_price,
+            limit_price=request.limit_price,
+            duration=duration or Duration.DAY,
+            session=Session.NORMAL,
+        )
 
     if request.instruction == "BUY":
         order = equity_buy_limit(symbol, quantity, limit_price) if request.order_type == "LIMIT" else equity_buy_market(symbol, quantity)
@@ -698,7 +696,7 @@ def _build_equity_order_with_protection(
             instruction=exit_instruction,
             trail_offset=request.trailing_stop_offset,
             duration=resolved_duration,
-            session=Session.NORMAL if resolved_duration == Duration.GOOD_TILL_CANCEL else resolved_session,
+            session=Session.NORMAL,
         ))
     elif request.stop_loss_price is not None:
         exit_orders.append(_build_stop_exit_order(
@@ -707,7 +705,7 @@ def _build_equity_order_with_protection(
             instruction=exit_instruction,
             stop_price=request.stop_loss_price,
             duration=resolved_duration,
-            session=Session.NORMAL if resolved_duration == Duration.GOOD_TILL_CANCEL else resolved_session,
+            session=Session.NORMAL,
         ))
 
     if not exit_orders:
@@ -780,6 +778,27 @@ def _build_stop_exit_order(
         .set_order_type(OrderType.STOP)
         .set_stop_type(StopType.STANDARD)
         .set_stop_price(format(Decimal(str(stop_price)).quantize(Decimal("0.01")), "f"))
+        .add_equity_leg(_resolve_equity_instruction(instruction), symbol, quantity))
+
+
+def _build_stop_limit_exit_order(
+    *,
+    symbol: str,
+    quantity: float,
+    instruction: str,
+    stop_price: float,
+    limit_price: float,
+    duration: Duration,
+    session: Session,
+) -> OrderBuilder:
+    return (OrderBuilder()
+        .set_session(session)
+        .set_duration(duration)
+        .set_order_strategy_type(OrderStrategyType.SINGLE)
+        .set_order_type(OrderType.STOP_LIMIT)
+        .set_stop_type(StopType.STANDARD)
+        .set_stop_price(format(Decimal(str(stop_price)).quantize(Decimal("0.01")), "f"))
+        .set_price(format(Decimal(str(limit_price)).quantize(Decimal("0.01")), "f"))
         .add_equity_leg(_resolve_equity_instruction(instruction), symbol, quantity))
 
 

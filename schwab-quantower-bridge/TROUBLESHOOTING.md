@@ -62,6 +62,14 @@ Correct bridge repo root:
 Live Quantower vendor bundle:
 - `D:\Quantower\TradingPlatform\v1.145.17\bin\Vendors\SchwabVendor`
 
+Live Quantower POS-only vendor bundle:
+- current reinstalled QT path: `D:\Quantower\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabPosOnlyVendor`
+- older QT path: `D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabPosOnlyVendor`
+- QT connection name: `Schwab POS ONLY/NO DATA`
+- purpose: Schwab account, positions, orders, order actions, trades, and account P/L only
+- market data is intentionally disabled; use dxFeed for Quotes & Trades, Tick History, Minute History, Day History, and Volume analysis in QT symbol mapping
+- do not install POS-only DLLs into the original `SchwabVendor` folder
+
 Disabled legacy script DLL (must stay disabled to avoid duplicate assembly load):
 - `D:\Quantower\Settings\Scripts\Vendors\SchwabVendor.dll.disabled-20260420_092609`
 
@@ -1914,3 +1922,1177 @@ Fix
   - `D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabVendor`
 - rebuild and copy the vendor bundle into the new QT runtime folder
 - re-run Schwab OAuth login if backend endpoints still return `refresh_token_authentication_error`
+
+## Issue 26: Duplicate Order Blocked By Schwab Bridge
+
+Symptoms
+- QT popup appears when placing another order at the same symbol/side/price:
+```text
+400 Bad Request: Duplicate order blocked by Schwab bridge duplicate-protection window
+```
+- user intentionally wants to place multiple separate orders at the identical price level
+
+Root Cause
+- this was a bridge-side backend guard, not a QT-native restriction
+- `backend/app/services/broker.py` fingerprinted recent orders and rejected repeats inside `SCHWAB_DUPLICATE_WINDOW_SECONDS`
+- that guard was too restrictive for active DOM trading because repeated same-price orders can be intentional
+
+Fix
+- removed duplicate-order fingerprint enforcement from `SchwabBrokerService.place_order`
+- removed the unused `SCHWAB_DUPLICATE_WINDOW_SECONDS` config setting
+- kept the actual safety checks intact:
+  - trading kill switch
+  - max shares / max notional limits
+  - fractional share block
+  - limit price deviation check
+  - Schwab preview reject handling
+
+Verification
+- source search should show no active references to:
+  - `Duplicate order blocked`
+  - `enforce_duplicate`
+  - `_is_duplicate_order`
+  - `_remember_order`
+  - `schwab_duplicate_window_seconds`
+- syntax check:
+```powershell
+python -c "import pathlib; [compile(pathlib.Path(p).read_text(encoding='utf-8'), p, 'exec') for p in ['backend/app/services/broker.py','backend/app/config.py']]; print('syntax ok')"
+```
+
+Notes
+- this change affects order validation only
+- it does not touch DOM, Level II, market data, streaming, positions, or avg-price/P&L behavior
+- after changing backend Python code, restart the bridge so the running process loads the update
+
+## Issue 27: QT Orders Window Shows Stale Orders And Buttons Do Not Work
+
+Symptoms
+- QT Orders window shows orders that were already canceled in ToS/Schwab
+- selecting an order row does not make `Cancel selected`, `Modify order`, or `Change to market` work reliably
+- backend diagnostic can show:
+```text
+/api/broker/orders => []
+```
+while QT still displays old order rows
+
+Root Cause
+- QT order rows are driven by `MessageOpenOrder` and cleared by `MessageCloseOrder`
+- the bridge handled explicit terminal statuses returned by Schwab, for example `CANCELED`, `FILLED`, `REPLACED`
+- but if an order disappeared from Schwab's active/recent order response, the bridge did not compare the new successful order set against cached open orders
+- result: QT could keep a stale local order row with an order id that Schwab no longer considers active
+- `/api/broker/orders` also returned `[]` on Schwab auth failures, which was unsafe because a failed order fetch could look like a valid empty order set
+
+Fix
+- update `SchwabMarketDataVendor.ReconcileOrderStatuses(...)`
+- build a current order-id set from each successful backend order refresh
+- for every cached cancelable/open order missing from the successful refresh, push:
+```csharp
+new MessageCloseOrder { OrderId = cachedOrder.OrderId }
+```
+- remove that order from the bridge cache and log:
+```text
+PushClosedOrder orderId=...
+```
+- update `/api/broker/orders` so auth failures raise an error instead of returning an empty list
+
+Verification
+- Python syntax check:
+```powershell
+python -c "import pathlib; [compile(pathlib.Path(p).read_text(encoding='utf-8'), p, 'exec') for p in ['backend/app/routes/broker.py','backend/app/services/broker.py','backend/app/config.py']]; print('python syntax ok')"
+```
+- bridge build:
+```powershell
+dotnet build .\src\SchwabQuantowerBridge\SchwabQuantowerBridge.csproj -c Release
+```
+- build result:
+  - `0 Error(s)`
+  - existing XML-comment warnings only
+- deployed rebuilt files to:
+  - `D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabVendor\SchwabVendor.dll`
+  - `D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabVendor\SchwabVendor.pdb`
+
+Notes
+- this fix uses the existing order refresh/polling path
+- no DOM, Level II, market-data, streaming, positions, or P&L logic was changed
+- `Change to market` is still separate: bridge modification currently supports limit-order modification only
+
+## Issue 28: QT Still Shows Non-Cancelable Stale Orders After Close Messages
+
+Symptoms
+- QT Orders window still shows old order rows
+- selecting those rows does not successfully cancel
+- bridge/backend logs do not show a matching:
+```text
+DELETE /api/broker/orders/{account_hash}/{order_id}
+```
+- backend `/api/broker/orders` can show zero active/cancelable orders while QT still displays rows
+
+Diagnostic
+- check current Schwab active orders:
+```powershell
+$orders = (Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:8000/api/broker/orders').Content | ConvertFrom-Json
+$orders | Where-Object { $_.status -match 'OPEN|WORKING|QUEUED|PENDING|ACCEPTED|AWAITING|NEW' }
+```
+- if this returns nothing, Schwab/backend has no live orders to cancel
+- if QT still shows rows, they are local stale QT rows
+- check bridge debug log:
+```powershell
+Get-Content "$env:LOCALAPPDATA\SchwabQuantowerBridge\SchwabVendor.debug.log" -Tail 200
+```
+- expected stale-row cleanup messages:
+```text
+PushClosedOrder orderId=...
+```
+
+Root Cause
+- Issue 27 added `MessageCloseOrder` for terminal/missing orders
+- however, each closed order message was pushed only once per bridge process
+- if QT missed that one close event during reconnect/startup/window timing, the stale row could remain visible
+- after that, QT would not send a backend cancel request for the stale row, so no `DELETE /api/broker/orders/...` appeared in backend logs
+
+Fix
+- keep the existing stale-order reconciliation
+- add a throttled close-message rebroadcast for terminal orders
+- rebroadcast interval:
+```text
+ClosedOrderRebroadcastInterval = 5 seconds
+```
+- active orders clear the closed-message throttle state
+- stale terminal close messages can be resent periodically until QT removes the rows
+
+Verification
+- backend showed no active/cancelable orders:
+```text
+REPLACED 56
+CANCELED 21
+FILLED 14
+REJECTED 5
+EXPIRED 1
+```
+- bridge build:
+```powershell
+dotnet build .\src\SchwabQuantowerBridge\SchwabQuantowerBridge.csproj -c Release
+```
+- build result:
+  - `0 Error(s)`
+  - existing XML-comment warnings only
+- deployed rebuilt files to:
+  - `D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabVendor\SchwabVendor.dll`
+  - `D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabVendor\SchwabVendor.pdb`
+
+Notes
+- this does not touch DOM, Level II, market data, positions, P&L, or order placement
+- this does not add new REST polling
+- it only changes how often already-known terminal order close messages are resent to QT
+- if QT still shows stale rows after deployment, fully restart QT so the updated live vendor DLL is loaded
+
+## Issue 29: Short Option Position Shows Red P/L When It Is Profitable In ToS
+
+Symptoms
+- ToS shows a profitable short option position, for example:
+```text
+SHORT INTC 100 (Weeklys) 8 MAY 26 99 CALL
+Qty: -10
+Trade price: 4.00
+Mark: about 3.30
+P/L Open: about +700.00
+```
+- QT shows the same option row as short with the correct average price, but P/L is negative
+- example QT row:
+```text
+Short INTC 260508C00099000
+Quantity: -10
+Avg P: 4.00
+Last: about 3.45
+P/L: negative
+```
+
+Meaning
+- this is a bridge position/P&L mapping issue, not a DOM, Level II, quote-stream, or Schwab account issue
+- for short options, profit increases when option price falls
+- options also require the 100x contract multiplier
+
+Checks
+- inspect live backend positions:
+```powershell
+(Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:8000/api/broker/positions').Content
+```
+- confirm the short option has:
+```text
+quantity < 0
+average_price around contract premium, for example 4.00
+asset_type OPTION or instrument_type VANILLA
+market_price around contract premium, for example 3.30
+unrealized_profit_loss populated from Schwab shortOpenProfitLoss
+```
+- if `market_price` is around `330.00` instead of `3.30`, the option multiplier normalization is broken
+- if `unrealized_profit_loss` is null for a short option, the backend is only reading long P/L fields
+
+What Was Researched
+- compared ToS position display against `/api/broker/positions`
+- confirmed Schwab backend payload can provide separate long/short open P/L fields
+- confirmed option market value is contract-multiplied
+- reviewed QT bridge `MessageOpenPosition` and `CalculatePnL(...)`
+
+What Did Not Help
+- changing DOM columns or QT window settings
+- restarting only the DOM window
+- treating the short option as an equity position
+- using the raw signed short quantity directly in `CalculatePnL(...)`
+
+Root Cause
+- backend `market_price` used:
+```text
+marketValue / quantity
+```
+which is wrong for options because Schwab option market value includes the 100x contract multiplier
+- backend only mapped `longOpenProfitLoss`, so short-option open P/L could be missing
+- QT `CalculatePnL(...)` used a short-aware price difference but multiplied by raw `parameters.Quantity`; if QT supplied a negative short quantity, the result flipped back to negative
+- QT option multiplier fallback referenced option helper methods that were missing from the live source
+
+Fix
+- backend `get_positions(...)` now computes signed quantity once and passes it through position mapping
+- backend `_resolve_market_price(...)` divides option market value by `quantity * 100`
+- backend `_resolve_open_profit_loss(...)` reads:
+```text
+shortOpenProfitLoss for short positions
+longOpenProfitLoss for long positions
+```
+- QT `CalculatePnL(...)` now uses `Math.Abs(parameters.Quantity)` after determining long/short side
+- QT option P/L multiplier detection now supports:
+```text
+assetType == OPTION
+instrumentType == VANILLA
+OCC-style symbols like INTC 260508C00099000
+```
+- QT option price normalization keeps a defensive guard for accidental 100x market prices
+
+Verification
+- Python no-write syntax check:
+```powershell
+python -c "from pathlib import Path; p=Path('backend/app/services/broker.py'); compile(p.read_text(encoding='utf-8'), str(p), 'exec'); print('python syntax ok')"
+```
+- bridge build:
+```powershell
+dotnet build .\src\SchwabQuantowerBridge\SchwabQuantowerBridge.csproj -c Release
+```
+- build result:
+  - `0 Error(s)`
+  - existing XML-comment warnings only
+- deployed rebuilt files to:
+  - `D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabVendor\SchwabVendor.dll`
+  - `D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabVendor\SchwabVendor.pdb`
+
+Acceptance Check
+- for a short option:
+```text
+open premium 4.00
+current/mark premium 3.30
+contracts 10
+```
+- expected P/L:
+```text
+(4.00 - 3.30) * 10 * 100 = +700.00
+```
+- QT position row should show positive P/L when ToS shows the short option profitable
+
+Notes
+- this fix does not touch DOM ladder data, Level II, market-depth subscriptions, snapshot fanout, order placement, cancel/modify behavior, or latency-sensitive polling
+- if QT was already open during deployment, fully restart QT so it loads the updated vendor DLL
+
+## Issue 30: Option DOM Ladder Price-Level P/L Is Divided By 100
+
+Symptoms
+- QT Positions window and DOM bottom summary show correct option P/L, for example:
+```text
+Short 10 contracts
+Avg price: 4.00
+Current/selected price: 3.05
+Gross P/L: 950.00 USD
+```
+- but the DOM ladder price-level `P&L` column shows:
+```text
+9.5
+```
+instead of:
+```text
+950.00
+```
+
+Meaning
+- this is not a Schwab quote or backend position problem if the Positions row and DOM bottom summary are already correct
+- the per-price ladder column is using QT symbol contract metadata
+- listed equity options need a 100x contract multiplier
+
+Checks
+- verify the math:
+```text
+(4.00 - 3.05) * 10 contracts * 100 = 950.00
+```
+- if QT ladder shows `9.5`, it is calculating:
+```text
+(4.00 - 3.05) * 10 contracts
+```
+- inspect option symbol creation in:
+```text
+src\SchwabQuantowerBridge\Quantower\SchwabMarketDataVendor.cs
+```
+
+What Was Researched
+- compared QT Positions P/L, DOM bottom Gross P/L, and DOM ladder per-price `P&L`
+- reviewed `CalculatePnL(...)`
+- reviewed option `MessageSymbol` creation
+- checked QT API/business-object docs locally
+
+What Did Not Help
+- changing backend position P/L mapping
+- changing `CalculatePnL(...)` alone
+- treating this as a Level II, ladder-depth, or market-data feed issue
+
+Root Cause
+- option `MessageSymbol` was created with:
+```csharp
+LotSize = 1d
+```
+- QT's DOM ladder price-level P/L uses symbol contract metadata for row-by-row P/L
+- therefore QT displayed per-contract-dollar math instead of equity-option 100x contract math
+- a fallback path could also create OCC-style option symbols through generic symbol creation with `LotSize = 1d`
+
+Fix
+- set listed option symbols to:
+```csharp
+LotSize = 100d
+```
+- update generic symbol fallback so OCC-style option symbols resolve to `SymbolType.Options`
+- set generic fallback `LotSize = 100d` when `symbolType == SymbolType.Options`
+
+Verification
+- bridge build:
+```powershell
+dotnet build .\src\SchwabQuantowerBridge\SchwabQuantowerBridge.csproj -c Release
+```
+- build result:
+  - `0 Error(s)`
+  - existing XML-comment warnings only
+- deployed rebuilt files to:
+  - `D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabVendor\SchwabVendor.dll`
+  - `D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabVendor\SchwabVendor.pdb`
+
+Acceptance Check
+- open the same option DOM after QT reloads the vendor DLL
+- at selected/row price `3.05` for short 10 contracts opened at `4.00`, expected DOM ladder P/L is:
+```text
+950.00
+```
+
+Notes
+- this only changes option symbol metadata
+- it does not touch DOM depth, Level II, streaming, backend polling, order cancellation, duplicate order behavior, or equity P/L
+- if QT was already running during deployment, restart QT so it reloads the vendor DLL and symbol metadata
+
+## Issue 31: Option Position P/L Only Updates After Selecting The Option Row
+
+Symptoms
+- QT Positions window shows an option position, for example:
+```text
+Short INTC 260508C00099000
+Quantity: -10
+Avg P: 4.00
+```
+- ToS option mark/P&L changes automatically
+- QT option P/L remains stale until the option row is selected in the Positions window
+- after selecting the row, QT updates the option value/P&L
+
+Meaning
+- selection causes QT to request/subscribe the exact option symbol
+- before selection, the option symbol may not have active quote/mark traffic inside QT
+- this is separate from equity DOM, Level II, Time & Sales, and order flow
+
+Checks
+- verify the option position appears in:
+```powershell
+(Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:8000/api/broker/positions').Content
+```
+- compare the option `market_price` / P&L in backend output against QT before and after selecting the row
+- if QT updates only after selection, the issue is stale QT option-position republishing, not the Schwab account itself
+
+What Was Researched
+- reviewed `GetPositions(...)`
+- reviewed `RefreshPositionsAsync(...)`
+- reviewed `ReconcilePositions(...)`
+- reviewed `PrimeRealtimeSymbol(...)`
+- confirmed the existing bridge refreshed positions on initial QT request and after order lifecycle events, but did not run a continuous position-refresh loop
+
+What Did Not Help
+- changing DOM/Level II/market-depth subscriptions
+- changing order polling cadence
+- forcing option stream subscriptions from DOM/Level II code paths
+- relying on manual row selection to trigger QT symbol activity
+
+Root Cause
+- options are not always actively subscribed by QT unless selected/opened
+- the bridge did not continuously republish changed option positions
+- therefore option P/L could stay stale in the Positions window until selection caused QT to request that option symbol
+
+Fix
+- add a separate option-position-only polling loop:
+```text
+OptionPositionPollingInterval = 10 seconds
+```
+- this loop fetches positions from the backend, filters to open option positions only, and pushes `MessageOpenPosition` only when option qty/price/P&L values changed
+- it updates cached latest option prices for P/L math
+- it sends `MessageClosePosition` for stale option positions that disappear from Schwab
+
+Verification
+- bridge build:
+```powershell
+dotnet build .\src\SchwabQuantowerBridge\SchwabQuantowerBridge.csproj -c Release
+```
+- build result:
+  - `0 Error(s)`
+  - existing XML-comment warnings only
+- deployed rebuilt files to:
+  - `D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabVendor\SchwabVendor.dll`
+  - `D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabVendor\SchwabVendor.pdb`
+
+Acceptance Check
+- start bridge and QT
+- leave the option row unselected
+- when Schwab option mark/P&L changes, QT option position P/L should update within about 10 seconds
+- selecting the row should no longer be required just to refresh option position P/L
+
+Notes
+- this does not touch DOM depth
+- this does not touch Level II
+- this does not start quote streams
+- this does not alter order flow, order placement, cancel/modify, or order polling cadence
+- this does not alter equity position refresh behavior
+- interval is intentionally low-frequency to protect latency and platform performance
+
+## Issue 32: Schwab POS-Only Equity P/L Stale After Hours While dxFeed DOM Price Is Live
+
+Symptoms
+- QT is connected using:
+  - `Schwab POS ONLY/NO DATA` for trading/positions
+  - `dxFeed` for Quotes & Trades / history / volume analysis
+- DOM ladder shows the live after-hours dxFeed price
+- Positions row and DOM footer P/L stay stale after regular market close
+- example:
+```text
+INTC avg: 56.04995
+dxFeed last: 111.15
+Positions/Dom footer P/L still lower than live-price math
+```
+
+Meaning
+- this is not a dxFeed data problem if the DOM price ladder is live
+- this is not a DOM/Level II subscription problem
+- the stale value is coming from the bridge P/L calculation path using a cached Schwab/position price instead of QT's current mapped dxFeed close/last price
+
+Checks
+- compare:
+  - Positions `LAST`
+  - DOM current price
+  - DOM footer Gross P/L
+  - manual math:
+```text
+(current price - average price) * quantity
+```
+- inspect:
+```text
+src\SchwabQuantowerBridge.PosOnly\Quantower\SchwabMarketDataVendor.cs
+src\SchwabQuantowerBridge\Quantower\SchwabMarketDataVendor.cs
+```
+- confirm `CalculatePnL(...)` uses `parameters.ClosePrice` before falling back to bridge cached latest price
+
+What Was Researched
+- checked this file first, especially Issue 10 around DOM footer P/L binding
+- compared full connector and POS-only connector `CalculatePnL(...)`
+- confirmed both connectors were using only `TryGetLatestPrice(...)`
+- confirmed POS-only intentionally ignores quote subscriptions, so it must use QT-supplied dxFeed price when QT requests P/L
+
+What Did Not Help
+- changing DOM or Level II data subscriptions
+- adding Schwab market-data subscriptions back into POS-only
+- increasing polling
+- touching order flow, order polling, or depth logic
+
+Root Cause
+- `CalculatePnL(...)` ignored `PnLRequestParameters.ClosePrice`
+- in POS-only mode, the bridge cache can reflect slower Schwab/position refresh values, especially after hours
+- QT already has the live dxFeed price and passes it through the P/L request; the bridge was not prioritizing it
+
+Fix
+- in both connector implementations, update `CalculatePnL(...)`:
+```csharp
+var currentPrice = parameters.ClosePrice;
+if (currentPrice <= 0 &&
+    (!this.TryGetLatestPrice(symbolId, out currentPrice) || currentPrice <= 0))
+    return base.CalculatePnL(parameters);
+```
+- changed files:
+  - `src\SchwabQuantowerBridge.PosOnly\Quantower\SchwabMarketDataVendor.cs`
+  - `src\SchwabQuantowerBridge\Quantower\SchwabMarketDataVendor.cs`
+
+Verification
+- build POS-only connector:
+```powershell
+dotnet build .\src\SchwabQuantowerBridge.PosOnly\SchwabQuantowerBridge.PosOnly.csproj -c Release
+```
+- build full connector:
+```powershell
+dotnet build .\src\SchwabQuantowerBridge\SchwabQuantowerBridge.csproj -c Release
+```
+- both builds completed with:
+  - `0 Error(s)`
+  - existing XML-comment warnings only
+- deployed to:
+  - `D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabPosOnlyVendor\SchwabPosOnlyVendor.dll`
+  - `D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabVendor\SchwabVendor.dll`
+
+Acceptance Check
+- restart QT so it loads the updated vendor DLL
+- reconnect `Schwab POS ONLY/NO DATA`
+- keep dxFeed mapped as the market-data source
+- after hours, confirm Positions P/L and DOM footer P/L match live dxFeed price math
+
+Notes
+- this is latency-safe:
+  - no new REST polling
+  - no new quote subscriptions
+  - no DOM/Level II/order-flow changes
+  - no bridge market-data re-enable for POS-only
+- this only changes which already-available price source `CalculatePnL(...)` prefers
+
+---
+
+## Issue 33 - Quantower Opens `MAIN.xml` Instead Of `MAIN` Workspace
+
+### Symptoms
+- QT startup selects a workspace displayed as `MAIN.xml` instead of the intended `MAIN` workspace.
+- Workspace menu shows duplicate-looking entries such as `MAIN`, `MAIN.xml`, and `MAIN BACKUP`.
+- QT may keep reopening the wrong workspace after restart.
+
+### Meaning
+- Quantower treats files in `D:\Quantower\Settings\Workspaces` as workspace definitions.
+- A workspace saved with `.xml` in the display name can become a real file named `MAIN.xml.xml`, which QT then displays as `MAIN.xml`.
+- If multiple workspace XML files have `isActive=true`, startup selection can become ambiguous.
+
+### Checks
+```powershell
+Get-ChildItem 'D:\Quantower\Settings\Workspaces' -File | Select-Object Name,FullName,Length,LastWriteTime
+```
+
+```powershell
+foreach($f in Get-ChildItem 'D:\Quantower\Settings\Workspaces' -File -Filter '*.xml') {
+  $xml=[xml](Get-Content -LiteralPath $f.FullName -Raw)
+  $active=($xml.settings.Item | Where-Object { $_.Name -eq 'isActive' } | Select-Object -First 1).Value
+  "{0} = {1}" -f $f.Name,$active
+}
+```
+
+### What Was Researched
+- Inspected `D:\Quantower\Settings\Workspaces`.
+- Found valid `MAIN` workspace stored as `D:\Quantower\Settings\Workspaces\ MAIN.xml`.
+- Found accidental duplicate `D:\Quantower\Settings\Workspaces\MAIN.xml.xml`.
+- Confirmed `MAIN.xml.xml` had `isActive=false`, but its presence still made QT show a `MAIN.xml` workspace entry.
+- Found ` MAIN.xml` and ` MAIN BACKUP.xml` were both marked active, which is not ideal for deterministic startup.
+
+### What Did Not Help
+- Keeping `MAIN.xml.xml` in the live workspace folder, even inactive, because QT still lists it as a workspace.
+- Relying only on the QT UI to choose the right workspace when duplicate files exist.
+
+### Root Cause
+- Duplicate workspace file naming caused by a workspace name containing `.xml`.
+- Multiple active workspace flags existed in the workspace folder.
+
+### Fix
+- Close QT first so it cannot overwrite workspace settings on exit.
+- Back up workspace files to a timestamped folder under `D:\Quantower\Settings\Workspaces`.
+- Set `D:\Quantower\Settings\Workspaces\ MAIN.xml` to `isActive=true`.
+- Set `D:\Quantower\Settings\Workspaces\ MAIN BACKUP.xml` to `isActive=false`.
+- Move `D:\Quantower\Settings\Workspaces\MAIN.xml.xml` out of the live workspace folder into the backup folder as `MAIN.xml.xml.disabled`.
+
+### Verification
+```powershell
+Get-ChildItem 'D:\Quantower\Settings\Workspaces' -File | Select-Object Name,Length,LastWriteTime
+```
+
+Expected live workspace files should include ` MAIN.xml` and ` MAIN BACKUP.xml`, but not `MAIN.xml.xml`.
+
+```powershell
+foreach($f in Get-ChildItem 'D:\Quantower\Settings\Workspaces' -File -Filter '*.xml') {
+  $xml=[xml](Get-Content -LiteralPath $f.FullName -Raw)
+  $active=($xml.settings.Item | Where-Object { $_.Name -eq 'isActive' } | Select-Object -First 1).Value
+  "{0} = {1}" -f $f.Name,$active
+}
+```
+
+Expected:
+- ` MAIN.xml = true`
+- ` MAIN BACKUP.xml = false`
+
+### Acceptance Check
+- Start QT.
+- Workspace selector should load/select `MAIN`, not `MAIN.xml`.
+- `MAIN.xml` should not reappear unless a workspace is manually saved with `.xml` in the name.
+
+### Notes
+- Do not name a QT workspace with `.xml` in the UI. Use `MAIN`, not `MAIN.xml`.
+- Backup from this fix was created at `D:\Quantower\Settings\Workspaces\_codex_workspace_fix_20260509_160002`.
+- This is a QT settings/workspace fix only; bridge code and market-data paths are not involved.
+
+Issue 33 update on 2026-05-09:
+- QT recreated `D:\Quantower\Settings\Workspaces\MAIN.xml.xml` after the first cleanup because it had reopened/saved that duplicate workspace.
+- Stronger fix used: copy the newest `MAIN.xml.xml` layout into the real `D:\Quantower\Settings\Workspaces\ MAIN.xml`, set ` MAIN.xml` active, set ` MAIN BACKUP.xml` inactive, then move `MAIN.xml.xml` out of the live folder.
+- Strong-fix backup: `D:\Quantower\Settings\Workspaces\_codex_workspace_fix_strong_20260509_160506`.
+- Final live check showed only ` MAIN.xml = true` and ` MAIN BACKUP.xml = false`; no live `MAIN.xml.xml` reference remained.
+
+Issue 33 second update on 2026-05-09:
+- Prior cleanup still failed because the intended workspace file itself had a leading space in the filename: `D:\Quantower\Settings\Workspaces\ MAIN.xml`.
+- QT recreated `MAIN.xml.xml` because the canonical `MAIN.xml` file did not exist without the leading space.
+- Correct permanent fix is to use canonical workspace filenames with no leading spaces:
+  - `D:\Quantower\Settings\Workspaces\MAIN.xml` active true
+  - `D:\Quantower\Settings\Workspaces\MAIN BACKUP.xml` active false
+  - no live `D:\Quantower\Settings\Workspaces\MAIN.xml.xml`
+- Latest duplicate layout was preserved into canonical `MAIN.xml` before moving the bad files out of the live folder.
+- Canonical-fix backup: `D:\Quantower\Settings\Workspaces\_codex_workspace_fix_canonical_20260509_160756`.
+
+---
+
+## Issue 34: POS-Only DOM Footer Blank While Positions Grid Shows Correct P/L
+
+Symptoms
+- QT Positions grid shows the Schwab POS-only position correctly.
+- Symbol mapping is active with:
+  - tradeable symbol from `SCH POS` / `Schwab POS ONLY/NO DATA`
+  - data symbol from `dxFeed`
+- DOM ladder and dxFeed price/volume data are live.
+- DOM footer still shows:
+  - `Quantity & Average open price` => `---`
+  - `Gross Profit / Loss` => `---`
+- Example seen on 2026-05-11:
+  - INTC long 1000 shares displayed correctly in Positions grid
+  - DOM selected `INTC SCH POS`
+  - DOM footer stayed blank even though Positions P/L was populated
+
+Meaning
+- This is not a dxFeed issue if the DOM ladder/price/volume is visible.
+- This is not a Level II/order-flow issue.
+- This is not a missing Schwab position issue if the Positions grid row exists.
+- This is specifically a Quantower DOM-footer `CalculatePnL(...)` context issue in the POS-only connector.
+
+Checks
+- Confirm Positions grid has the symbol, quantity, average price, and P/L.
+- Confirm DOM selected connection is `SCH POS` / POS-only, not IBKR or another account.
+- Confirm symbol mapping has dxFeed selected for market data.
+- Confirm `src\SchwabQuantowerBridge.PosOnly\Quantower\SchwabMarketDataVendor.cs` has the cached-position fallback inside `CalculatePnL(...)`.
+- Confirm the live DLL was deployed to the reinstalled QT vendor folder:
+  - `D:\Quantower\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabPosOnlyVendor\SchwabPosOnlyVendor.dll`
+
+What Was Researched
+- Checked this troubleshooting file first, especially Issue 10 and Issue 32.
+- Compared the symptom against prior DOM-footer issues:
+  - Positions grid correct
+  - DOM market data correct
+  - only footer avg/P&L blank
+- Inspected POS-only `CalculatePnL(...)` implementation.
+- Confirmed the method used `parameters.OpenPrice`, `parameters.Quantity`, and `parameters.Side` directly.
+- Confirmed Quantower can request DOM-footer P/L without sending a complete open-position context.
+- Confirmed POS-only already caches Schwab positions in `positionCache` through `GetPositions(...)` / `ReconcilePositions(...)`.
+
+What Did Not Help
+- Changing DOM columns.
+- Changing dxFeed mapping.
+- Touching Level II, ladder, quotes, trades, or history subscriptions.
+- Re-enabling Schwab market data in POS-only mode.
+- Treating this as a data-feed issue.
+
+Root Cause
+- POS-only `CalculatePnL(...)` returned `base.CalculatePnL(parameters)` when Quantower's DOM-footer request did not provide a positive `OpenPrice`.
+- In that path, QT had enough information elsewhere because the bridge already had the Schwab position cached, but the method did not fall back to that cache.
+- Result: Positions grid was correct, but DOM footer rendered blank.
+
+Fix
+- Changed only the POS-only connector P/L path:
+  - `src\SchwabQuantowerBridge.PosOnly\Quantower\SchwabMarketDataVendor.cs`
+- Added `ResolvePositionForPnl(...)` to resolve cached positions by:
+  - `PositionId`
+  - `AccountId + SymbolId`
+  - `SymbolId`
+- Updated `CalculatePnL(...)` to fall back to cached Schwab position values when QT does not supply them:
+  - `AveragePrice` for missing `OpenPrice`
+  - cached absolute position quantity for missing request quantity
+  - cached signed quantity for long/short side
+  - cached market price only if QT close price and local latest price are unavailable
+- Preserved the prior Issue 32 behavior:
+  - when QT provides `parameters.ClosePrice`, use it first so dxFeed remains the live price source.
+
+Verification
+- Built POS-only connector only:
+```powershell
+dotnet build .\src\SchwabQuantowerBridge.PosOnly\SchwabQuantowerBridge.PosOnly.csproj -c Release
+```
+- Build result:
+  - 0 errors
+  - warnings only for existing XML documentation warnings
+- Deployed only POS-only connector artifacts to:
+  - `D:\Quantower\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabPosOnlyVendor`
+- Deployed DLL timestamp observed:
+  - `SchwabPosOnlyVendor.dll` => `2026-05-11 07:33:56`
+
+Acceptance Check
+- Restart QT so it loads the new POS-only vendor DLL.
+- Reconnect `Schwab POS ONLY/NO DATA`.
+- Keep dxFeed mapped for Quotes & Trades / history / volume analysis.
+- Open a fresh DOM Trader window for a Schwab POS-only position.
+- Confirm DOM footer now shows:
+  - quantity and average open price
+  - gross profit/loss
+- Existing already-open DOM windows may need to be reopened because QT can cache the old footer binding per window instance.
+
+Notes
+- This is latency-safe:
+  - no REST polling added
+  - no dxFeed path changed
+  - no Schwab market-data path re-enabled
+  - no DOM ladder or Level II code changed
+  - no order-flow code changed
+- This is a POS-only connector fix only.
+- If this recurs, inspect `CalculatePnL(...)` and cached position resolution before doing broader research.
+---
+
+## Issue 35: DOM B/S Own-Order Columns Do Not Show Open Schwab POS Orders
+
+Symptoms
+- QT Orders window shows an open Schwab POS-only order correctly.
+- Example live case on 2026-05-11:
+  - `CORZ` buy limit
+  - price `22.99`
+  - quantity `800`
+  - status `WORKING`
+  - remaining quantity `800`
+- DOM Trader for the same mapped `SCH POS` symbol does not show the user's own order size in the `B` / bid column or `S` / ask column.
+- After the first fix attempt, the order could flash/show briefly at the correct DOM price level and then disappear.
+- dxFeed DOM ladder, volume, and market data remain healthy.
+
+Meaning
+- This is not a Schwab order-placement failure if `/api/broker/orders` shows the order as open with nonzero remaining quantity.
+- This is not a dxFeed, DOM ladder, Level II, or market-data issue.
+- This is specifically a QT open-order binding/update issue in the POS-only connector.
+
+Checks
+1. Confirm backend order payload:
+```powershell
+(Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:8000/api/broker/orders').Content
+```
+2. Verify the live order has:
+- matching symbol
+- `status` such as `WORKING`
+- correct `price`
+- correct `quantity`
+- positive `remaining_quantity`
+3. Confirm QT Orders window displays the order.
+4. Confirm the DOM own-order `B` / `S` column remains blank at the order price.
+
+What Was Researched
+- Checked this troubleshooting file first for prior order lifecycle issues.
+- Reviewed POS-only order path in:
+  - `src\SchwabQuantowerBridge.PosOnly\Quantower\SchwabMarketDataVendor.cs`
+- Verified live backend order payload for the current `CORZ` order.
+- Confirmed the backend reported the order correctly:
+  - `WORKING`
+  - `BUY`
+  - `LIMIT`
+  - `22.99`
+  - `quantity = 800`
+  - `remaining_quantity = 800`
+- Reviewed `CreateOpenOrder(...)`, `CreateOptimisticOrder(...)`, `ReconcileOrderStatuses(...)`, and order polling.
+- Reviewed live debug log:
+  - `C:\Users\Owner\AppData\Local\SchwabQuantowerBridge\SchwabVendor.debug.log`
+- Confirmed the follow-up failure pattern:
+  - `PushClosedOrder` was repeatedly emitted for many old canceled/replaced/filled order ids every refresh
+  - this close-message storm could clear QT's DOM own-order overlay after the correct open-order message briefly appeared
+
+What Did Not Help
+- Treating the issue as missing Schwab order data.
+- Treating it as a dxFeed data problem.
+- Changing DOM ladder, Level II, quote, history, or volume-analysis code.
+- Changing polling cadence or adding new REST loops.
+- Repeatedly rebroadcasting `MessageCloseOrder` for already-closed historical orders.
+
+Root Cause
+- When an order is placed from QT, the connector immediately pushes an optimistic `MessageOpenOrder`.
+- The optimistic order had `Quantity` and `Price`, but did not set:
+  - `FilledQuantity`
+  - `RemainingQuantity`
+  - `AverageFillPrice`
+- QT could show the order in the Orders grid, but the DOM own-order overlay may rely on the open-order message's display quantity/remaining quantity.
+- The later Schwab refresh returned the correct `remaining_quantity`, but `ReconcileOrderStatuses(...)` only considered status changes.
+- Since the optimistic status and real status were both `WORKING`, the connector did not re-push the corrected open-order message.
+- A second root cause appeared after the first fix:
+  - historical terminal orders were allowed to rebroadcast close messages every few seconds
+  - QT kept receiving close-order messages for old order ids
+  - even though the active order was valid, the DOM own-order overlay could be cleared after briefly showing
+
+Fix
+- In POS-only connector only:
+  - optimistic orders now set `FilledQuantity = 0`, `RemainingQuantity = quantity`, and `AverageFillPrice = price`
+  - order reconciliation now detects meaningful display-state changes, not only status changes
+  - if price, total quantity, filled quantity, remaining quantity, symbol, instruction, order type, or duration changes, the connector re-pushes `MessageOpenOrder`
+  - do not periodically re-publish active open orders; this can cause repeated QT alerts/sounds
+  - terminal order close messages are now one-shot per order id instead of rebroadcast every few seconds
+- This lets QT refresh the DOM `B` / `S` own-order columns without touching market-data paths.
+
+Files Updated
+- `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\src\SchwabQuantowerBridge.PosOnly\Quantower\SchwabMarketDataVendor.cs`
+
+Verification
+- Build:
+```powershell
+dotnet build .\src\SchwabQuantowerBridge.PosOnly\SchwabQuantowerBridge.PosOnly.csproj -c Release
+```
+- Result:
+  - `0 Error(s)`
+  - existing XML-doc warnings only
+- Deployed to:
+  - active production QT path: `D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabPosOnlyVendor`
+
+Path Warning
+- Do not deploy this fix only to the duplicate/nested install:
+  - `D:\Quantower\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabPosOnlyVendor`
+- The active reinstall path is:
+  - `D:\Quantower`
+
+Acceptance Check
+- Restart QT so it loads the updated POS-only DLL.
+- Keep bridge running; bridge restart is not required for this DLL-only change.
+- Connect `SCH POS` / `Schwab POS ONLY/NO DATA`.
+- Place or keep an open limit order.
+- Confirm QT Orders window shows the order.
+- Confirm DOM `B` column shows buy orders and DOM `S` column shows sell orders at the correct price level.
+
+Safety Notes
+- No dxFeed market-data code changed.
+- No DOM ladder or Level II code changed.
+- No quote, trade, history, volume-analysis, or order-flow data path changed.
+- No new polling loop was added.
+- Avoid any recurring open-order re-publish loop unless QT support confirms it is required; the attempted 2-second active-order refresh caused repeated QT alerts.
+- This is limited to POS-only open-order message completeness and re-publish criteria.
+
+Deployment Path Note - 2026-05-11
+- Correct active Quantower install for current production use is:
+  - `D:\Quantower`
+- Correct active POS-only vendor deployment path is:
+  - `D:\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabPosOnlyVendor`
+- Do not deploy production fixes only to the nested duplicate install:
+  - `D:\Quantower\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SchwabPosOnlyVendor`
+- The nested path exists from reinstall/migration history and can cause false-positive deployments where source builds succeed but QT still runs the older DLL.
+- Future QT vendor fixes must verify the live DLL timestamp in the active `D:\Quantower\TradingPlatform\...` path before telling the user the patch is deployed.
+
+---
+
+## Issue 15: SCH TRD Executions Fill But QT Positions Do Not Update Immediately
+
+Symptoms
+- Schwab/thinkorswim shows filled executions.
+- QT Orders panel removes the filled order.
+- QT Positions panel still shows the old quantity, old average price, or missing updated P/L.
+- Example observed on 2026-05-14:
+  - IREN buy fills appeared in Schwab.
+  - QT still showed the prior IREN position quantity instead of immediately reflecting the new fills.
+
+Meaning
+- The order lifecycle was reaching QT, but position lifecycle messages were not being pushed immediately after fills.
+- QT was waiting for the next position snapshot/reconnect path instead of receiving an immediate position update.
+
+Checks
+- QT order/fill evidence:
+```powershell
+Select-String -LiteralPath 'D:\Quantower _ LATEST\Quantower\Logs\Serilog\20260514.slog' -Pattern 'IREN|Order update|Order remove|Trading operation result|SCH TRD'
+```
+- Confirm whether the order disappears after execution but no position row update follows in QT.
+- Confirm the active SCH TRD DLL path:
+  - `D:\Quantower _ LATEST\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SCHTRDVendor\SCHTRDVendor.dll`
+
+What Was Researched
+- Quantower BusinessLayer XML in the active install:
+  - `D:\Quantower _ LATEST\Quantower\TradingPlatform\v1.146.7\bin\TradingPlatform.BusinessLayer.xml`
+- Relevant QT protocol:
+  - `Position.UpdateByMessage(MessageOpenPosition)` is the QT path for applying position changes.
+  - `MessageClosePosition` is the QT path for removing a position that no longer exists.
+- Existing working bridge pattern:
+  - reconcile broker positions
+  - push changed `MessageOpenPosition`
+  - push `MessageClosePosition` for stale/closed positions
+
+What Did Not Help
+- Treating this as a dxFeed problem.
+- Treating this as DOM or T&S configuration.
+- Waiting for normal order-only polling to update positions.
+- Updating only `MessageOpenOrder` / `MessageCloseOrder`; those fix order display, not position quantity.
+
+Root Cause
+- SCH TRD order polling detected open/closed order changes, but did not refresh and push positions immediately after a fill/removal/fill-state change.
+- Quantower does not infer updated position quantity from the order row alone.
+- QT needs explicit position messages from the vendor:
+  - `MessageOpenPosition` for updated/open positions
+  - `MessageClosePosition` for positions that disappeared
+
+Fix
+- In SCH TRD connector only:
+  - added position reconciliation using `MessageOpenPosition`
+  - added stale/closed position cleanup using `MessageClosePosition`
+  - order polling now triggers `RefreshPositionsAsync(...)` when an order fill/removal/fill-state change is detected
+  - scheduled post-order reconciliation also refreshes positions when order state implies execution activity
+- This is bounded to order lifecycle changes.
+- It does not touch dxFeed, DOM market data, T&S, Level II, history, or volume analysis.
+
+Files Updated
+- `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\src\SCHTRD\Quantower\SchwabTradingVendor.cs`
+
+Verification
+- Build:
+```powershell
+dotnet build "D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\src\SCHTRD\SCHTRD.csproj" -c Release
+```
+- Result:
+  - `0 Error(s)`
+  - existing XML-doc warnings only
+- Deployed to active QT install:
+  - `D:\Quantower _ LATEST\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SCHTRDVendor`
+- Deployed DLL timestamp:
+  - `SCHTRDVendor.dll` modified `2026-05-14 11:05:45`
+
+Acceptance Check
+- Restart QT after deployment so it loads the updated vendor DLL.
+- Bridge restart is not required for this DLL-only change.
+- Connect SCH TRD.
+- Place a small limit order that fills, or observe a real fill.
+- Confirm:
+  - QT Orders panel removes/updates the filled order.
+  - QT Positions panel updates the symbol quantity immediately after the fill.
+  - QT P/L and average price refresh from the new position message.
+
+Notes
+- This fix follows Quantower's documented position-message protocol.
+- Do not solve position update lag with market-data changes.
+- Do not add high-frequency market-data or DOM polling.
+- If position updates are still late after this fix, inspect Schwab `/api/broker/positions` response timing because QT can only display the position after SCH TRD receives the updated broker position snapshot.
+
+---
+
+## Issue 16: SCH TRD Order Action Timing Baseline From QT Logs
+
+Symptoms
+- User needs to know whether QT-to-Schwab order action timing is acceptable.
+- DOM order placement, modification, or cancellation may feel slow during fast market movement.
+
+Meaning
+- There are two separate timing legs:
+  - QT request to Schwab operation result: broker/API round trip.
+  - Schwab operation result to QT order update/remove: QT vendor message propagation.
+- The first leg is mostly outside QT once `Vendor.PlaceOrder`, `Vendor.ModifyOrder`, or `Vendor.CancelOrder` has called the backend.
+- The second leg is controlled by QT vendor protocol and should be nearly immediate when `MessageOpenOrder` / `MessageCloseOrder` is pushed after success.
+
+Checks
+- Extract SCH TRD order request/result timing from QT Serilog:
+```powershell
+Select-String -LiteralPath 'D:\Quantower _ LATEST\Quantower\Logs\Serilog\20260514.slog' -Pattern 'Limit order placing request|Limit order modify request|Limit order cancel request|Trading operation result|Order update|Order remove'
+```
+
+What Was Researched
+- QT log entries on 2026-05-14 for SCH TRD order actions.
+- Request-to-result timing was calculated by matching `RequestId`.
+- The most important comparison is:
+  - `Limit order ... request`
+  - matching `Trading operation result`
+  - then immediate `Order update` / `Order remove`
+
+What Did Not Help
+- Changing dxFeed, T&S, DOM, or symbol mapping settings.
+- Treating order routing latency as market-data latency.
+- Waiting for order polling as the primary display mechanism.
+
+Root Cause
+- Remaining user-visible order action delay is primarily Schwab API round-trip time, not QT display propagation, after the immediate order-message fix.
+- QT display propagation after success is typically milliseconds when the vendor pushes `MessageOpenOrder` / `MessageCloseOrder` immediately.
+
+Fix
+- Keep the QT vendor path:
+  - user action enters `Vendor.PlaceOrder`, `Vendor.ModifyOrder`, or `Vendor.CancelOrder`
+  - backend sends the Schwab order action
+  - after Schwab confirms, return `TradingOperationResult.CreateSuccess`
+  - immediately push `MessageOpenOrder` for open/replaced orders
+  - immediately push `MessageCloseOrder` for stale/replaced/canceled order ids
+- Do not fake pre-confirmation order states in QT.
+
+Verification
+- 2026-05-14 successful SCH TRD timing from QT logs:
+  - place orders: average about `3.7s`, min about `2.7s`, max about `6.1s`
+  - modify orders: average about `2.6s`, min about `1.5s`, max about `6.6s`
+  - cancel orders: average about `3.6s`, min about `2.6s`, max about `4.5s`
+- After the immediate order-message fix, examples show result-to-QT update/remove near immediate:
+  - `10:07:23.051` modify request RXT to `6.08`
+  - `10:07:25.026` Schwab/QT operation success
+  - `10:07:25.027` QT order update at `6.08`
+  - QT post-success display propagation was effectively immediate; the `~1.98s` delay was the broker/API leg.
+
+Acceptance Check
+- For future tests, calculate:
+  - request to result: acceptable if typically near `1.5s-3.5s`, but not ideal for ultra-fast scalping
+  - result to QT order update/remove: should be near immediate, usually milliseconds
+- If request-to-result spikes above `5s`, treat as Schwab/backend/API latency investigation.
+- If result-to-QT update is above `1s`, treat as QT vendor message/caching defect.
+
+Notes
+- This baseline is specific to SCH TRD over Schwab's API and Quantower vendor integration.
+- It is not comparable to a direct-access broker or native IBKR-style low-latency order route.
+- For QT performance, avoid adding high-frequency polling or market-data diagnostics to solve broker order latency.
+
+---
+
+## Issue 17: SCH TRD Open Order Shows In Orders Grid But Not DOM / DOM Surface Order Overlay
+
+Symptoms
+- QT Orders panel shows an active SCH TRD order.
+- The same symbol is open in DOM Trader or DOM Surface with SCH TRD as the tradable connection and dxFeed as the mapped data connection.
+- The resting order price is visible in the ladder, but the DOM own-order `B` / `S` column or DOM Surface order line stays blank at that price.
+- Example observed on 2026-05-18:
+  - `ZETA`
+  - `Buy`
+  - `Limit`
+  - price `18.75`
+  - quantity `1`
+  - order appeared in Orders grid but not in the DOM `B`/bid own-order column.
+- Validated breakthrough example observed on 2026-05-19:
+  - `NOW`
+  - `Sell`
+  - `Limit`
+  - price `103.50`
+  - quantity `1`
+  - order appeared in Orders grid, DOM Trader, and DOM Surface/heatmap after the fix.
+
+Meaning
+- The broker order exists and QT receives enough order state to populate the Orders grid.
+- The failure is not a dxFeed market-data problem.
+- The failure is in how SCH TRD publishes the Quantower open-order lifecycle message used by DOM own-order overlays and DOM Surface order lines.
+
+Checks
+- Confirm the order is active in QT Orders grid.
+- Confirm the same symbol/account is selected in DOM Trader.
+- Confirm the DOM View menu has `Orders` enabled.
+- Confirm the SCH TRD source sends `MessageOpenOrder` for the active order.
+- Confirm `MessageOpenOrder.PositionId` is set.
+- Do not change dxFeed, Level II, T&S, chart, or symbol-mapping data settings for this issue.
+
+What Was Researched
+- Checked the prior DOM own-order troubleshooting section around lines 2696-2745.
+- Verified the active SCH TRD code path in:
+  - `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\src\SCHTRD\Quantower\SchwabTradingVendor.cs`
+- Verified current Quantower v1.146.7 build behavior by compiling against:
+  - `D:\Quantower _ LATEST\Quantower\TradingPlatform\v1.146.7\bin\TradingPlatform.BusinessLayer.dll`
+- Confirmed `MessageOpenOrder` in this QT build exposes:
+  - `AccountId`
+  - `OrderId`
+  - `GroupId`
+  - `PositionId`
+  - `SymbolId`
+  - `Price`
+  - `TriggerPrice`
+  - `OrderTypeId`
+  - `Side`
+  - `Status`
+  - `TotalQuantity`
+  - `FilledQuantity`
+- Compared against the working IBKR behavior:
+  - IBKR open limit orders display as native QT order overlays in DOM Trader and DOM Surface.
+  - A `SNAP IBKR` sell limit order at `5.74` quantity `1` displayed as `LMT 1` at the exact price level.
+- Rechecked SCH TRD's `CreateOpenOrder()` path and confirmed it had a helper capable of generating a normalized position id:
+  - `GetOrderPositionId(order)`
+
+What Did Not Help
+- Adding `RemainingQuantity` to `MessageOpenOrder`; the active QT API does not support that property.
+- Treating this as a market-data display problem.
+- Changing dxFeed or DOM Level II settings.
+- Adding more polling.
+- Removing `PositionId` from open-order messages. That interpretation was wrong for the active v1.146.7 behavior and must not be repeated.
+
+Root Cause
+- SCH TRD was not setting `MessageOpenOrder.PositionId`.
+- QT could still display the order in the Orders grid from account/order/symbol fields.
+- DOM Trader and DOM Surface order overlays require the order to bind into QT's position/order layer with a matching position id.
+- Without `PositionId`, SCH TRD orders were visible in the Orders panel but did not attach to the price ladder or DOM Surface order overlay.
+
+Fix
+- In SCH TRD only:
+  - set `PositionId = GetOrderPositionId(order)` inside `CreateOpenOrder()`
+  - keep `AccountId`, `OrderId`, `GroupId`, normalized symbol id, side, price, order type, status, `TotalQuantity`, and `FilledQuantity`
+  - keep using dxFeed through symbol mapping for market data
+- This fix stays inside QT's intended `MessageOpenOrder` protocol.
+- This fix does not touch dxFeed, Level II, T&S, DOM data settings, chart settings, or symbol mapping.
+
+Files Updated
+- `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\src\SCHTRD\Quantower\SchwabTradingVendor.cs`
+
+Code Shape
+```csharp
+private static MessageOpenOrder CreateOpenOrder(BrokerOrderDto order)
+{
+    var filledQuantity = Math.Abs(order.FilledQuantity ?? 0d);
+    var totalQuantity = Math.Abs(order.Quantity ?? 0d);
+    var message = new MessageOpenOrder(NormalizeSymbolKey(order.Symbol ?? string.Empty))
+    {
+        AccountId = order.AccountHash,
+        OrderId = order.OrderId,
+        GroupId = ResolveOrderGroupId(order),
+        PositionId = GetOrderPositionId(order),
+        Price = order.Price ?? double.NaN,
+        TriggerPrice = order.TriggerPrice ?? order.StopPrice ?? double.NaN,
+        OrderTypeId = ConvertSchwabOrderType(order.OrderType),
+        Side = ConvertInstructionSide(order.Instruction),
+        Status = ConvertOrderStatus(order.Status),
+        TotalQuantity = totalQuantity,
+        FilledQuantity = filledQuantity
+    };
+
+    return message;
+}
+```
+
+Verification
+- Build:
+```powershell
+dotnet build 'D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\src\SCHTRD\SCHTRD.csproj' -c Release
+```
+- Result:
+  - `0 Error(s)`
+  - `0 Warning(s)` on the 2026-05-19 validation build
+- Deployment path:
+  - `D:\Quantower _ LATEST\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SCHTRDVendor\SCHTRDVendor.dll`
+- Restart requirement:
+  - QT must be closed before copying the DLL.
+  - QT must be restarted after deployment.
+  - Schwab backend restart is not required for this DLL-only change.
+- Runtime validation:
+  - Place a small SCH TRD limit order.
+  - Confirm it appears in Orders grid.
+  - Confirm it appears as an order marker in DOM Trader.
+  - Confirm it appears as an order line/marker in DOM Surface/heatmap.
+  - Confirm cancel removes the marker.
+
+Acceptance Check
+- Restart QT after deployment.
+- Connect dxFeed first, then SCH TRD.
+- Open a mapped SCH TRD DOM Trader.
+- Place a small resting limit order away from market.
+- Confirm:
+  - Orders grid shows the active order.
+  - DOM own-order column displays the order quantity at the exact price level.
+  - DOM Surface/heatmap displays the order line/marker at the exact price level.
+  - Modify/cancel still updates the order through `MessageOpenOrder` / `MessageCloseOrder`.
+
+Notes
+- This was a major SCH TRD/QT integration breakthrough.
+- The fix confirms the issue was QT open-order message binding, not dxFeed, not DOM settings, not T&S, and not Schwab order placement.
+- If this issue returns, inspect `CreateOpenOrder()` first and confirm `PositionId = GetOrderPositionId(order)` is still present before changing anything else.

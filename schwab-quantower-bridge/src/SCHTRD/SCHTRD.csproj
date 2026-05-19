@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>SCHTRDVendor</AssemblyName>
+    <RootNamespace>SchwabQuantowerBridge</RootNamespace>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="TradingPlatform.BusinessLayer">
+      <HintPath>D:\Quantower _ LATEST\Quantower\TradingPlatform\v1.146.7\bin\TradingPlatform.BusinessLayer.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="TradingPlatform.PresentationLayer.Plugins">
+      <HintPath>D:\Quantower _ LATEST\Quantower\TradingPlatform\v1.146.7\bin\TradingPlatform.PresentationLayer.Plugins.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

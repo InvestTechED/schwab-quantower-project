@@ -218,8 +218,9 @@ class EquityOrderRequest(BaseModel):
     symbol: str
     quantity: float = Field(gt=0)
     instruction: Literal["BUY", "SELL", "SELL_SHORT", "BUY_TO_COVER"]
-    order_type: Literal["MARKET", "LIMIT"]
+    order_type: Literal["MARKET", "LIMIT", "STOP", "STOP_LIMIT"]
     limit_price: float | None = Field(default=None, gt=0)
+    stop_price: float | None = Field(default=None, gt=0)
     time_in_force: Literal["DAY", "GTC"] | None = None
     stop_loss_price: float | None = Field(default=None, gt=0)
     take_profit_price: float | None = Field(default=None, gt=0)
@@ -232,6 +233,7 @@ class ModifyEquityOrderRequest(BaseModel):
     symbol: str
     quantity: float = Field(gt=0)
     instruction: Literal["BUY", "SELL", "SELL_SHORT", "BUY_TO_COVER"]
-    order_type: Literal["LIMIT"]
-    limit_price: float = Field(gt=0)
+    order_type: Literal["LIMIT", "STOP", "STOP_LIMIT"]
+    limit_price: float | None = Field(default=None, gt=0)
+    stop_price: float | None = Field(default=None, gt=0)
     time_in_force: Literal["DAY", "GTC"] | None = None
