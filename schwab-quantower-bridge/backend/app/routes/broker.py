@@ -2,38 +2,12 @@ from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 
-from app.config import settings
-from app.models import BrokerAccount
 from app.models import EquityOrderRequest, ModifyEquityOrderRequest
 from app.services.broker import SchwabBrokerService
 
 router = APIRouter(tags=["broker"])
 
 broker_service = SchwabBrokerService()
-
-
-def _is_auth_failure(exc: Exception) -> bool:
-    detail = getattr(getattr(exc, "response", None), "text", None) or str(exc)
-    normalized = detail.lower()
-    return (
-        "refresh_token_authentication_error" in normalized or
-        "unsupported_token_type" in normalized or
-        "token file is missing" in normalized
-    )
-
-
-def _fallback_accounts() -> list[BrokerAccount]:
-    if not settings.schwab_fallback_account_number:
-        return []
-
-    account_number = settings.schwab_fallback_account_number
-    return [
-        BrokerAccount(
-            account_number=account_number,
-            account_hash=account_number,
-            account_type="CASH"
-        )
-    ]
 
 
 def _raise_broker_error(exc: Exception) -> None:
@@ -48,8 +22,6 @@ def broker_accounts():
     try:
         return broker_service.get_accounts()
     except Exception as exc:
-        if _is_auth_failure(exc):
-            return _fallback_accounts()
         _raise_broker_error(exc)
 
 
@@ -58,8 +30,6 @@ def broker_positions():
     try:
         return broker_service.get_positions()
     except Exception as exc:
-        if _is_auth_failure(exc):
-            return []
         _raise_broker_error(exc)
 
 
@@ -76,8 +46,6 @@ def broker_orders(
             to_entered_datetime=to_entered_datetime,
         )
     except Exception as exc:
-        if _is_auth_failure(exc):
-            return []
         _raise_broker_error(exc)
 
 
@@ -94,8 +62,6 @@ def broker_executions(
             to_entered_datetime=to_entered_datetime,
         )
     except Exception as exc:
-        if _is_auth_failure(exc):
-            return []
         _raise_broker_error(exc)
 
 
@@ -112,8 +78,6 @@ def broker_trades(
             to_time=to_time,
         )
     except Exception as exc:
-        if _is_auth_failure(exc):
-            return []
         _raise_broker_error(exc)
 
 

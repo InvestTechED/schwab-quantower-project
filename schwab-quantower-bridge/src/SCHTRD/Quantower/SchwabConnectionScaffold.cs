@@ -17,7 +17,10 @@ public sealed class SchwabVendor : Vendor
     {
         VendorName = VendorName,
         VendorDescription = loc.key("Schwab accounts, positions, orders, and trading only. Market data intentionally disabled for dxFeed mapping."),
-        GetDefaultConnections = () => new List<ConnectionInfo>(),
+        GetDefaultConnections = () => new List<ConnectionInfo>
+        {
+            CreateDefaultConnectionInfo(VendorName, VendorName, Path.Combine("SCHTRDVendor", "schwab.svg"))
+        },
         GetConnectionParameters = () => new List<SettingItem>()
     };
 
@@ -83,8 +86,8 @@ public sealed class SchwabVendor : Vendor
         // mapping should source all market data from dxFeed while this connector
         // remains responsible for account, position, order, and trading messages.
         //
-        // Still forward the subscription to the trading vendor so it can publish
-        // the current order/position snapshot for DOM visual-trading overlays.
+        // Quantower calls this hook when panels bind to a symbol. SCH TRD uses it
+        // only to republish cached account-side overlays for that symbol.
         this.currentVendor?.SubscribeSymbol(parameters);
     }
 

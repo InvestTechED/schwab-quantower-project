@@ -4,9 +4,6 @@ from fastapi import FastAPI
 
 from app.routes.auth import router as auth_router
 from app.routes.broker import router as broker_router
-from app.routes.market import router as market_router
-from app.routes.stream import router as stream_router
-from app.services.stream import streaming_service
 
 
 def create_app() -> FastAPI:
@@ -20,12 +17,10 @@ def create_app() -> FastAPI:
     )
     app.include_router(auth_router, prefix="/api")
     app.include_router(broker_router, prefix="/api")
-    app.include_router(market_router, prefix="/api")
-    app.include_router(stream_router, prefix="/api")
 
-    @app.on_event("shutdown")
-    async def shutdown_streaming() -> None:
-        await streaming_service.shutdown()
+    @app.get("/api/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
 
     return app
 

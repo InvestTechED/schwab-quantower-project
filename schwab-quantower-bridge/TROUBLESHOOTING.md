@@ -2983,7 +2983,8 @@ Checks
 - Confirm the same symbol/account is selected in DOM Trader.
 - Confirm the DOM View menu has `Orders` enabled.
 - Confirm the SCH TRD source sends `MessageOpenOrder` for the active order.
-- Confirm `MessageOpenOrder.PositionId` is set.
+- For normal DOM ladder `SINGLE` orders, confirm `MessageOpenOrder.PositionId` is blank, matching native IBKR behavior.
+- For true attached/protective orders, confirm `MessageOpenOrder.PositionId` is set only when QT should classify the order as position-attached TP/SL.
 - Do not change dxFeed, Level II, T&S, chart, or symbol-mapping data settings for this issue.
 
 What Was Researched
@@ -3016,17 +3017,20 @@ What Did Not Help
 - Treating this as a market-data display problem.
 - Changing dxFeed or DOM Level II settings.
 - Adding more polling.
-- Removing `PositionId` from open-order messages. That interpretation was wrong for the active v1.146.7 behavior and must not be repeated.
+- Removing `PositionId` from all open-order messages. That is too broad.
+- Setting `PositionId` on every open-order message. That makes normal DOM ladder orders look like position-attached TP/SL orders in QT.
 
 Root Cause
-- SCH TRD was not setting `MessageOpenOrder.PositionId`.
-- QT could still display the order in the Orders grid from account/order/symbol fields.
-- DOM Trader and DOM Surface order overlays require the order to bind into QT's position/order layer with a matching position id.
-- Without `PositionId`, SCH TRD orders were visible in the Orders panel but did not attach to the price ladder or DOM Surface order overlay.
+- SCH TRD originally did not bind open orders reliably to QT's visual order layer.
+- A later fix over-corrected by setting `MessageOpenOrder.PositionId` on every open order.
+- IBKR comparison showed normal DOM ladder limit orders publish as plain `Limit/LMT` with blank `PosId`.
+- SCH TRD normal ladder orders with `PositionId` were reclassified by QT as `Limit(TP for <positionId>)`, which broke normal ladder/DOM Surface behavior.
 
 Fix
 - In SCH TRD only:
-  - set `PositionId = GetOrderPositionId(order)` inside `CreateOpenOrder()`
+  - set `PositionId = ResolveOpenOrderPositionId(order)` inside `CreateOpenOrder()`
+  - return blank `PositionId` for normal/unknown/`SINGLE` orders so QT treats them like native IBKR ladder orders
+  - return a real position id only for explicitly non-`SINGLE` attached/protective strategy orders
   - keep `AccountId`, `OrderId`, `GroupId`, normalized symbol id, side, price, order type, status, `TotalQuantity`, and `FilledQuantity`
   - keep using dxFeed through symbol mapping for market data
 - This fix stays inside QT's intended `MessageOpenOrder` protocol.
@@ -3046,7 +3050,7 @@ private static MessageOpenOrder CreateOpenOrder(BrokerOrderDto order)
         AccountId = order.AccountHash,
         OrderId = order.OrderId,
         GroupId = ResolveOrderGroupId(order),
-        PositionId = GetOrderPositionId(order),
+        PositionId = ResolveOpenOrderPositionId(order),
         Price = order.Price ?? double.NaN,
         TriggerPrice = order.TriggerPrice ?? order.StopPrice ?? double.NaN,
         OrderTypeId = ConvertSchwabOrderType(order.OrderType),
@@ -3093,6 +3097,393 @@ Acceptance Check
   - Modify/cancel still updates the order through `MessageOpenOrder` / `MessageCloseOrder`.
 
 Notes
-- This was a major SCH TRD/QT integration breakthrough.
+- This was a major SCH TRD/QT integration breakthrough, but the final rule was refined after comparing against native IBKR behavior.
 - The fix confirms the issue was QT open-order message binding, not dxFeed, not DOM settings, not T&S, and not Schwab order placement.
-- If this issue returns, inspect `CreateOpenOrder()` first and confirm `PositionId = GetOrderPositionId(order)` is still present before changing anything else.
+- If this issue returns, inspect `CreateOpenOrder()` first and confirm normal DOM ladder `SINGLE` orders publish with blank `PositionId` before changing anything else.
+
+Follow-Up: DOM Surface Order Line Appears Minutes Late
+
+Symptoms
+- SCH TRD order is visible in the QT Orders panel.
+- DOM Trader ladder can move/modify the order.
+- DOM Surface / DOM24Hrs order line does not appear immediately, then appears minutes later without a QT restart.
+- Example observed on 2026-05-20:
+  - `HIVE`
+  - SCH TRD limit orders were accepted and published immediately.
+  - DOM Surface displayed the order lines only after later refresh/repaint activity.
+
+Log Evidence
+- SCH TRD published the open order quickly after Schwab accepted it:
+```text
+Trading operation result Success
+Order update ... HIVE ... Opened, PosId: ...:HIVE
+```
+- During the same window, QT DOM Surface was loading/reloading dxFeed history and logged renderer pressure/errors:
+```text
+LoadingHistory ... dxFeed
+Collection was modified; enumeration operation may not execute.
+DomSurfaceMarketDepthDataRenderer.Draw(...)
+```
+
+Meaning
+- This is not a Schwab placement delay.
+- This is not a dxFeed entitlement or symbol-mapping problem.
+- The order lifecycle message reached QT, but DOM Surface can miss or defer rendering the overlay while its chart/history/render layer is busy.
+
+Fix
+- Preserve the immediate `MessageOpenOrder` push after user-initiated place/modify actions.
+- Keep normal 1-second polling change-only.
+- During the existing post-action reconciliation checkpoints, re-announce active open orders even when order fields are unchanged:
+  - 100 ms
+  - 600 ms
+  - 1500 ms
+- This gives DOM Surface fresh QT order messages after its chart/history/render layer settles.
+
+Files Updated
+- `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\src\SCHTRD\Quantower\SchwabTradingVendor.cs`
+
+Code Pattern
+```csharp
+private bool PublishOrderChanges(IReadOnlyList<BrokerOrderDto> orders, bool forceOpenOrderMessages = false)
+{
+    ...
+    if (isNewOrder || hasOrderChanged || forceOpenOrderMessages)
+        this.PushMessage(CreateOpenOrder(order));
+}
+```
+
+```csharp
+if (this.PublishOrderChanges(orders, forceOpenOrderMessages: true))
+{
+    ...
+}
+```
+
+Safety / Performance Notes
+- No new market-data subscriptions.
+- No dxFeed changes.
+- No new continuous polling loop.
+- Only a few small `MessageOpenOrder` messages are re-pushed after user order actions.
+- Normal order polling stays change-only to avoid platform load.
+
+## Issue 18: Mapped SCH TRD DOM Trader Does Not Show Day % Change
+
+Symptoms
+- DOM Trader is opened on a mapped SCH TRD tradable symbol, for example `HIVE SCHTRD`.
+- dxFeed mapping supplies live market data and DOM/tape values.
+- The Level1 bar shows live Last / Volume / Open-style fields, but the `%` daily change field is blank.
+- The same symbol usually shows day change correctly when opened directly as a dxFeed symbol.
+
+Root Cause
+- SCH TRD intentionally does not publish Schwab quotes, tape, DOM, or history.
+- That design is correct: dxFeed must remain the market-data source.
+- However, the SCH TRD `MessageSymbol` had:
+
+```csharp
+AllowCalculateRealtimeChange = false
+```
+
+- Quantower can use this symbol capability flag when deciding whether to calculate `Symbol.Change` / day `%` for the tradable symbol.
+- With mapped symbols, dxFeed supplies the data, but the tradable SCH TRD symbol still needs to permit Quantower's real-time change calculation.
+
+Fix
+- Keep SCH TRD market data disabled.
+- Do not add Schwab quotes or history back into SCH TRD.
+- Enable only Quantower's real-time change calculation flag:
+
+```csharp
+AllowCalculateRealtimeChange = true
+```
+
+Files Updated
+- `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\src\SCHTRD\Quantower\SchwabTradingVendor.cs`
+
+Safety / Performance Notes
+- This does not subscribe to Schwab market data.
+- This does not alter dxFeed mappings.
+- This does not add polling or backend calls.
+- It simply tells QT it may calculate day change for the SCH TRD tradable symbol using the mapped market-data stream.
+
+Acceptance Check
+- Restart QT after deployment.
+- Connect dxFeed.
+- Connect SCH TRD if needed for positions/orders.
+- Open a mapped SCH TRD DOM Trader.
+- Confirm the `%` field populates from dxFeed-backed market data.
+
+Verified Result
+- 2026-05-20: User confirmed the fix worked after deploying the updated SCH TRD DLL to:
+  - `D:\Quantower _ LATEST\Quantower\TradingPlatform\v1.146.7\bin\Vendors\SCHTRDVendor\SCHTRDVendor.dll`
+- Mapped SCH TRD stocks now generate the DOM Trader day `%` change field while still using dxFeed as the market-data source.
+
+## Issue 19: SCH TRD Orders Show In Orders Grid But DOM Overlay / Ladder Interaction Becomes Stale
+
+Symptoms
+- SCH TRD orders are live and visible in the QT Orders panel.
+- DOM Trader / DOM Surface order lines may not appear reliably or may appear late.
+- DOM visual-trading interaction can feel stale or frozen after placing or moving orders.
+- QT logs show SCH TRD data-latency warnings for mapped symbols, for example:
+
+```text
+SCH TRD:RXT;Data latency (22531ms)
+SCH TRD:RXT;Data latency (64164ms)
+```
+
+Root Cause
+- SCH TRD was correctly re-pushing `MessageOpenOrder` after user order actions.
+- However, each `MessageOpenOrder` used the broker/order entered time:
+
+```csharp
+LastUpdateTime = order.EnteredTime?.UtcDateTime ?? DateTime.UtcNow
+```
+
+- That made repeated QT order-state messages look stale.
+- QT's DOM visual-trading layer expects each open-order update message to represent the current update event, not the original broker order entry timestamp.
+- Re-announcing an order with an old `LastUpdateTime` can cause QT to flag the SCH TRD stream as stale and delay or miss DOM overlay binding.
+
+Fix
+- Keep `PositionId = GetOrderPositionId(order)` for DOM overlay binding.
+- Keep post-action open-order re-announcement.
+- Change order message update time to the current publish time:
+
+```csharp
+LastUpdateTime = DateTime.UtcNow
+```
+
+Additional Fix Found In Same Log Pass
+- QT `TimeInForce.GTC` was being sent to the backend as:
+
+```csharp
+GOOD_TILL_CANCEL
+```
+
+- The backend accepts:
+
+```text
+DAY
+GTC
+```
+
+- Change outbound QT-to-backend TIF conversion to:
+
+```csharp
+tif == TimeInForce.GTC ? "GTC" : "DAY"
+```
+
+Files Updated
+- `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\src\SCHTRD\Quantower\SchwabTradingVendor.cs`
+
+Safety / Performance Notes
+- No extra polling.
+- No market-data changes.
+- No dxFeed changes.
+- This only corrects QT order-message freshness and backend TIF translation.
+
+Acceptance Check
+- Restart QT after deployment.
+- Connect dxFeed and SCH TRD.
+- Place a resting SCH TRD limit order away from market.
+- Confirm:
+  - Orders grid shows it.
+  - Orders grid shows plain `Limit`, not `Limit(TP for...)`, for a normal DOM ladder order.
+  - DOM Trader overlay appears at the exact price and is draggable.
+  - DOM Surface/DOM24Hrs order line appears promptly and is movable like an IBKR order line.
+  - Moving the order up/down the ladder modifies it without stale/frozen behavior.
+  - GTC orders are no longer rejected with `GOOD_TILL_CANCEL` validation errors.
+
+Follow-Up: IBKR Reference For Normal DOM Ladder Orders
+
+Observed on 2026-05-21:
+- Native `SNAP IBKR` sell limit from DOM ladder displayed as:
+  - DOM Surface: `LMT 1.00`
+  - DOM Trader ladder: `1.00` marker at the order price
+- QT log for the IBKR order update showed a blank position id:
+
+```text
+Order update ... SNAP ... Sell, Limit, 0/1, Pr = 5.90, Opened, PosId: , GroupId: , Comment:
+```
+
+Bad SCH TRD behavior from the same log pass:
+
+```text
+Order update ... RXT ... Buy, Limit, 0/500, Pr = 3.88, Opened, PosId: <account>:RXT, GroupId: , Comment: Buy
+Limit(TP for <account>:RXT) order cancel request
+```
+
+Conclusion:
+- Normal DOM ladder orders must follow the IBKR shape and publish blank `PositionId`.
+- A non-empty `PositionId` should be reserved for true position-attached/protective strategy orders.
+- If QT shows `Limit(TP for...)` for a normal SCH TRD ladder order, this issue has regressed.
+
+Follow-Up: Multiple SCH TRD Accounts Can Break DOM Surface Order Binding
+
+Observed on 2026-05-21:
+- SCH TRD exposed two Schwab accounts to Quantower:
+  - `Schwab 44412901`
+  - `Schwab 46426462`
+- The inactive `...6462` account had no trading capital and QT sometimes defaulted DOM panels to it.
+- QT logs also showed repeated DOM interaction errors:
+
+```text
+Account and symbol must be from same connection
+```
+
+Impact:
+- Orders remained visible in the Orders grid.
+- DOM Trader ladder markers could become inconsistent.
+- DOM Surface / DOM24Hrs order lines could appear late or not appear even when `View -> Orders` was enabled.
+- This differed from native IBKR behavior, where the active account and symbol bind cleanly and the order line appears immediately.
+
+Fix:
+- SCH TRD now filters out Schwab accounts whose account number ends in `6462`.
+- The same account filter is applied to:
+  - accounts
+  - cash/balance messages
+  - positions
+  - pending orders
+  - trades
+  - symbol list generation
+  - order polling refreshes
+- Plain DOM ladder orders now also publish a blank `Comment`, matching the IBKR open-order message shape for normal limit/stop orders.
+
+Files Updated:
+- `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\src\SCHTRD\Quantower\SchwabTradingVendor.cs`
+
+Safety / Performance Notes:
+- No dxFeed changes.
+- No Schwab market-data subscriptions.
+- No extra polling.
+- The change reduces QT account-binding ambiguity by publishing only the active Schwab trading account.
+
+Acceptance Check:
+- Restart QT after deployment.
+- Connect dxFeed.
+- Connect SCH TRD.
+- In the SCH TRD connection/account selector, confirm only `Schwab 44412901` is visible.
+- Place a normal SCH TRD limit order from the DOM ladder.
+- Confirm:
+  - Orders grid shows the order.
+  - DOM Trader ladder marker appears and is draggable.
+  - DOM Surface / DOM24Hrs shows the order line promptly when `View -> Orders` is enabled.
+  - QT logs no longer spam `Account and symbol must be from same connection` for the active SCH TRD DOM panels.
+
+## Issue 20: SCH TRD DOM Trader Shows Decimal / Lot-Scaled Quantities Instead Of IBKR-Style Share Counts
+
+Symptoms
+- Same mapped symbol shows different DOM quantities depending on tradable connection.
+- Example `RXT` comparison:
+  - `RXT IBKR` displayed actual share values such as `6,584`, `367,123`, `573,367`.
+  - `RXT SCH TRD` displayed scaled decimal/lot values such as `65.84`, `3,671`, `5,731`.
+- This is visually disruptive during active trading because SCH TRD does not match the IBKR DOM display.
+
+Root Cause
+- SCH TRD generic equity symbols were first published with:
+
+```csharp
+QuotingType = SymbolQuotingType.LotSize
+VariableTickList = [new VariableTick(0.01)]
+```
+
+- For a mapped equity using dxFeed data, QT can render order book / tape size fields as lot-scaled values under `LotSize` quoting.
+- IBKR-style equity rendering uses actual share quantities.
+- The later QT API check showed the decisive path is `Symbol.FormatQuantity(...)`: when QT renders mapped market-data quantities, it uses the tradable symbol `LotSize`.
+- Mapped dxFeed equity depth/tape sizes arrive here in round-lot units, so `LotSize = 1d` leaves SCH TRD displaying `65.84` where IBKR displays `6,584`.
+
+Fix
+- Change SCH TRD equity symbol metadata to tick-size/tick-cost quoting and set equity `LotSize` to `100d`:
+
+```csharp
+QuotingType = SymbolQuotingType.TickSizeTickCost
+VariableTickList = [new VariableTick(0.01, 0.01, 2)]
+LotSize = 100d
+LotStep = 1d
+```
+
+- Do **not** multiply order quantity, position quantity, trade quantity, or Schwab API payloads by 100.
+- This is a Quantower display-metadata fix only. `PlaceOrder` and `ModifyOrder` must continue passing `parameters.Quantity` unchanged.
+
+Files Updated
+- `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\src\SCHTRD\Quantower\SchwabTradingVendor.cs`
+
+Safety / Performance Notes
+- No polling changes.
+- No Schwab market-data calls.
+- No dxFeed mapping changes.
+- This only changes QT symbol metadata so the DOM/T&S can render mapped dxFeed quantity fields like IBKR.
+
+Acceptance Check
+- Restart QT after deployment.
+- Open the same mapped symbol twice:
+  - `RXT SCH TRD`
+  - `RXT IBKR`
+- Confirm DOM Trader size/volume/book columns are displayed in the same actual-share scale.
+- If the old decimal values persist, remove and recreate the affected SCH TRD panel or symbol mapping so QT reloads the updated symbol metadata.
+
+Follow-Up: LotSize Display Fix Caused Broker Order Quantity To Route In Lots
+
+Symptoms
+- After setting SCH TRD equity `LotSize = 100d`, DOM/T&S display moved toward IBKR-style actual-share rendering.
+- However, SCH TRD order routing became unsafe:
+  - QT order quantity `10,000` resulted in a Schwab/ToS order for `100` shares.
+  - QT order quantity/position displays were being interpreted through lot metadata.
+
+Root Cause
+- `LotSize = 100d` makes QT treat SCH TRD equity quantities as round lots on the UI side.
+- The adapter was still passing `PlaceOrderRequestParameters.Quantity` and `ModifyOrderRequestParameters.Quantity` directly to Schwab.
+- With `LotSize = 100d`, those QT quantities are lot quantities, not Schwab share quantities.
+
+Fix
+- Keep `LotSize = 100d` for QT-facing mapped dxFeed DOM display.
+- Convert at the SCH TRD adapter boundary:
+  - QT -> Schwab order route: multiply QT lot quantity by `100` before sending to Schwab.
+  - Schwab -> QT positions/orders/trades: divide broker share quantity by `100` before publishing QT messages.
+- Do not alter dxFeed market data and do not call Schwab for market data.
+
+Files Updated
+- `D:\GitHub\Claude Code\schwab-quantower-project\schwab-quantower-bridge\src\SCHTRD\Quantower\SchwabTradingVendor.cs`
+
+Restart Required
+- QT restart required after DLL deployment.
+- Schwab backend restart not required for this DLL-only change.
+
+Acceptance Check
+- With SCH TRD connected, place a very small test order only:
+  - QT visible quantity `100` should route to Schwab/ToS as `100` shares.
+  - QT visible quantity `500` should route to Schwab/ToS as `500` shares.
+- Open positions/orders in QT should still display actual shares, not 100x inflated shares.
+- DOM/T&S mapped display should remain in actual-share style.
+
+Follow-Up: 2026-05-22 Retest Of LotSize Coupling
+
+What changed
+- Re-applied the QT lot-metadata path:
+
+```csharp
+private const double EquityLotSize = 100d;
+LotSize = EquityLotSize;
+```
+
+- Kept the adapter-boundary conversions:
+
+```csharp
+QT -> Schwab: ToBrokerShareQuantity(qtQuantity) = qtQuantity * EquityLotSize
+Schwab -> QT: ToQuantowerLotQuantity(brokerShares) = brokerShares / EquityLotSize
+```
+
+Why
+- QT appears to use the tradable symbol's `LotSize` when rendering mapped dxFeed DOM/T&S size fields.
+- With `LotSize = 1d`, SCH TRD mapped DOM/T&S can display round-lot or decimal-style quantities while IBKR/dxFeed show actual shares.
+- With `LotSize = 100d`, mapped DOM/T&S is expected to render closer to IBKR-style actual-share display.
+
+Known impact / risk
+- This is not a Schwab market-data change.
+- This does not add Schwab market-data calls.
+- This does not touch dxFeed mapping.
+- Positions, orders, trades, and routing are protected by the explicit boundary conversions above.
+- The main known risk is the DOM Trader right-side raw position card. If that UI reads raw `MessageOpenPosition.Quantity` without applying symbol lot formatting, it may show lot quantity instead of share quantity.
+- The Positions grid and Orders grid are expected to remain correct because the same `LotSize` metadata and converted quantities are used by QT's normal grid formatting.
+
+Decision rule
+- If DOM/T&S size display becomes correct and Positions/Orders remain correct, keep this path.
+- If the DOM right-side position card regresses while Positions/Orders stay correct, do not keep toggling `LotSize` blindly. Treat it as a QT API display-coupling limitation and send QT support the side-by-side evidence.
+- If Positions or routed order quantity becomes wrong, immediately revert this lot-size path before additional live trading.

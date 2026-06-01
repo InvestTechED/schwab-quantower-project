@@ -10,11 +10,14 @@ namespace SchwabQuantowerBridge.Quantower;
 internal sealed class SchwabTradingVendor : Vendor
 {
     private const string ExchangeId = "24EQ";
+    private const double EquityLotSize = 1d;
+    private const string ExcludedSchwabAccountNumberSuffix = "6462";
     private static readonly TimeSpan OrderPollingInterval = TimeSpan.FromSeconds(1);
     private static readonly int[] ActionRefreshScheduleMilliseconds = [100, 600, 1500];
     private readonly HttpClient httpClient = new();
     private readonly Dictionary<string, BrokerOrderDto> orderCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, BrokerPositionDto> positionCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> excludedAccountIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> closedPositionMessagesPushed = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> tradeMessagesPushed = new(StringComparer.OrdinalIgnoreCase);
     private readonly object syncRoot = new();
@@ -33,6 +36,7 @@ internal sealed class SchwabTradingVendor : Vendor
             if (!healthy)
                 return ConnectionResult.CreateFail("Local Schwab backend is unavailable.");
 
+            this.RefreshAccountFilter(connectRequestParameters.CancellationToken);
             this.connected = true;
             this.tradeTrackingStartedUtc = DateTime.UtcNow;
             this.StartOrderPolling();
@@ -50,6 +54,7 @@ internal sealed class SchwabTradingVendor : Vendor
         {
             this.orderCache.Clear();
             this.positionCache.Clear();
+            this.excludedAccountIds.Clear();
             this.closedPositionMessagesPushed.Clear();
             this.tradeMessagesPushed.Clear();
             this.tradeTrackingStartedUtc = DateTime.MinValue;
@@ -95,7 +100,7 @@ internal sealed class SchwabTradingVendor : Vendor
         if (client == null)
             return [];
 
-        return client.GetAccountsAsync(token).GetAwaiter().GetResult().Select(CreateAccount).ToList();
+        return this.GetVisibleBrokerAccounts(token).Select(CreateAccount).ToList();
     }
 
     public override IList<MessageCryptoAssetBalances> GetCryptoAssetBalances(CancellationToken token)
@@ -104,7 +109,7 @@ internal sealed class SchwabTradingVendor : Vendor
         if (client == null)
             return [];
 
-        return client.GetAccountsAsync(token).GetAwaiter().GetResult().Select(CreateAssetBalance).ToList();
+        return this.GetVisibleBrokerAccounts(token).Select(CreateAssetBalance).ToList();
     }
 
     public override IList<MessageOpenPosition> GetPositions(CancellationToken token)
@@ -116,7 +121,7 @@ internal sealed class SchwabTradingVendor : Vendor
         var positions = client.GetPositionsAsync(token)
             .GetAwaiter()
             .GetResult()
-            .Where(p => !string.IsNullOrWhiteSpace(p.Symbol) && Math.Abs(p.Quantity) > 0)
+            .Where(p => this.IsVisibleAccountHash(p.AccountHash) && !string.IsNullOrWhiteSpace(p.Symbol) && Math.Abs(p.Quantity) > 0)
             .ToList();
 
         lock (this.syncRoot)
@@ -135,7 +140,7 @@ internal sealed class SchwabTradingVendor : Vendor
         if (client == null)
             return [];
 
-        var orders = client.GetOrdersAsync(token).GetAwaiter().GetResult();
+        var orders = this.FilterVisibleOrders(client.GetOrdersAsync(token).GetAwaiter().GetResult());
         this.UpdateOrderCache(orders);
 
         return orders
@@ -155,6 +160,64 @@ internal sealed class SchwabTradingVendor : Vendor
         foreach (var order in this.GetPendingOrders(token))
             this.PushMessage(order);
     }
+
+    private void RefreshAccountFilter(CancellationToken token)
+    {
+        var client = this.backendClient;
+        if (client == null)
+            return;
+
+        this.UpdateAccountFilter(client.GetAccountsAsync(token).GetAwaiter().GetResult());
+    }
+
+    private List<BrokerAccountDto> GetVisibleBrokerAccounts(CancellationToken token)
+    {
+        var client = this.backendClient;
+        if (client == null)
+            return [];
+
+        var accounts = client.GetAccountsAsync(token).GetAwaiter().GetResult();
+        this.UpdateAccountFilter(accounts);
+        return accounts.Where(IsVisibleAccount).ToList();
+    }
+
+    private void UpdateAccountFilter(IEnumerable<BrokerAccountDto> accounts)
+    {
+        lock (this.syncRoot)
+        {
+            this.excludedAccountIds.Clear();
+            foreach (var account in accounts.Where(a => IsExcludedSchwabAccountNumber(a.AccountNumber)))
+            {
+                if (!string.IsNullOrWhiteSpace(account.AccountHash))
+                    this.excludedAccountIds.Add(account.AccountHash);
+            }
+        }
+    }
+
+    private static bool IsVisibleAccount(BrokerAccountDto account) =>
+        !IsExcludedSchwabAccountNumber(account.AccountNumber);
+
+    private static bool IsExcludedSchwabAccountNumber(string? accountNumber) =>
+        !string.IsNullOrWhiteSpace(accountNumber) &&
+        accountNumber.Trim().EndsWith(ExcludedSchwabAccountNumberSuffix, StringComparison.OrdinalIgnoreCase);
+
+    private bool IsVisibleAccountHash(string? accountHash)
+    {
+        if (string.IsNullOrWhiteSpace(accountHash))
+            return false;
+
+        lock (this.syncRoot)
+            return !this.excludedAccountIds.Contains(accountHash);
+    }
+
+    private List<BrokerOrderDto> FilterVisibleOrders(IEnumerable<BrokerOrderDto> orders) =>
+        orders.Where(o => this.IsVisibleAccountHash(o.AccountHash)).ToList();
+
+    private List<BrokerPositionDto> FilterVisiblePositions(IEnumerable<BrokerPositionDto> positions) =>
+        positions.Where(p => this.IsVisibleAccountHash(p.AccountHash)).ToList();
+
+    private List<BrokerTradeDto> FilterVisibleTrades(IEnumerable<BrokerTradeDto> trades) =>
+        trades.Where(t => this.IsVisibleAccountHash(t.AccountHash)).ToList();
 
     private void StartOrderPolling()
     {
@@ -187,7 +250,7 @@ internal sealed class SchwabTradingVendor : Vendor
         {
             try
             {
-                var orders = await client.GetOrdersAsync(token).ConfigureAwait(false);
+                var orders = this.FilterVisibleOrders(await client.GetOrdersAsync(token).ConfigureAwait(false));
                 if (this.PublishOrderChanges(orders))
                 {
                     await this.PublishRecentTradesAsync(client, token).ConfigureAwait(false);
@@ -214,7 +277,7 @@ internal sealed class SchwabTradingVendor : Vendor
         }
     }
 
-    private bool PublishOrderChanges(IReadOnlyList<BrokerOrderDto> orders)
+    private bool PublishOrderChanges(IReadOnlyList<BrokerOrderDto> orders, bool forceOpenOrderMessages = false)
     {
         var openOrders = orders
             .Where(o => !string.IsNullOrWhiteSpace(o.OrderId) && !string.IsNullOrWhiteSpace(o.Symbol) && IsCancelableOrderStatus(o.Status))
@@ -230,10 +293,14 @@ internal sealed class SchwabTradingVendor : Vendor
 
         foreach (var order in openOrders)
         {
-            if (!previous.TryGetValue(order.OrderId!, out var previousOrder) || HasOrderChanged(previousOrder, order))
+            var isNewOrder = !previous.TryGetValue(order.OrderId!, out var previousOrder);
+            var hasOrderChanged = !isNewOrder && HasOrderChanged(previousOrder!, order);
+
+            if (isNewOrder || hasOrderChanged || forceOpenOrderMessages)
             {
                 this.PushMessage(CreateOpenOrder(order));
-                if (previousOrder != null && HasFillStateChanged(previousOrder, order))
+
+                if (!isNewOrder && previousOrder != null && HasFillStateChanged(previousOrder, order))
                     shouldRefreshPositions = true;
             }
         }
@@ -276,7 +343,7 @@ internal sealed class SchwabTradingVendor : Vendor
         return client.GetTradesAsync(parameters.From, parameters.To, parameters.CancellationToken)
             .GetAwaiter()
             .GetResult()
-            .Where(t => !string.IsNullOrWhiteSpace(t.Symbol) && t.Quantity > 0 && t.Price > 0)
+            .Where(t => this.IsVisibleAccountHash(t.AccountHash) && !string.IsNullOrWhiteSpace(t.Symbol) && t.Quantity > 0 && t.Price > 0)
             .Select(CreateTrade)
             .OrderBy(t => t.DateTime)
             .ToList();
@@ -301,7 +368,8 @@ internal sealed class SchwabTradingVendor : Vendor
         var stopPrice = ResolveStopPrice(parameters);
         if (RequiresStopPrice(parameters.OrderTypeId) && stopPrice <= 0)
             return TradingOperationResult.CreateError(parameters.RequestId, "Stop trigger price is required.");
-        if (parameters.Quantity <= 0 || parameters.Quantity % 1 != 0)
+        var shareQuantity = ToBrokerShareQuantity(parameters.Quantity);
+        if (shareQuantity <= 0 || shareQuantity % 1 != 0)
             return TradingOperationResult.CreateError(parameters.RequestId, "SCH TRD allows whole-share orders only.");
 
         try
@@ -313,7 +381,7 @@ internal sealed class SchwabTradingVendor : Vendor
                     {
                         AccountHash = parameters.Account.Id,
                         Symbol = parameters.Symbol.Id,
-                        Quantity = parameters.Quantity,
+                        Quantity = shareQuantity,
                         Instruction = instruction,
                         OrderType = orderType,
                         LimitPrice = RequiresLimitPrice(parameters.OrderTypeId) ? parameters.Price : null,
@@ -334,7 +402,7 @@ internal sealed class SchwabTradingVendor : Vendor
                     orderType,
                     RequiresLimitPrice(parameters.OrderTypeId) ? parameters.Price : null,
                     RequiresStopPrice(parameters.OrderTypeId) ? stopPrice : null,
-                    parameters.Quantity,
+                    shareQuantity,
                     ConvertTimeInForce(parameters.TimeInForce)));
                 this.RefreshOrdersInBackground();
             }
@@ -359,7 +427,8 @@ internal sealed class SchwabTradingVendor : Vendor
         var stopPrice = ResolveStopPrice(parameters);
         if (RequiresStopPrice(parameters.OrderTypeId) && stopPrice <= 0)
             return TradingOperationResult.CreateError(parameters.RequestId, "A valid stop trigger price is required.");
-        if (parameters.Quantity <= 0 || parameters.Quantity % 1 != 0)
+        var shareQuantity = ToBrokerShareQuantity(parameters.Quantity);
+        if (shareQuantity <= 0 || shareQuantity % 1 != 0)
             return TradingOperationResult.CreateError(parameters.RequestId, "SCH TRD allows whole-share quantity changes only.");
 
         if (!this.TryGetCachedOrder(parameters.OrderId, out var currentOrder))
@@ -374,7 +443,7 @@ internal sealed class SchwabTradingVendor : Vendor
                         AccountHash = currentOrder.AccountHash,
                         OrderId = currentOrder.OrderId,
                         Symbol = currentOrder.Symbol ?? parameters.SymbolId,
-                        Quantity = parameters.Quantity,
+                        Quantity = shareQuantity,
                         Instruction = currentOrder.Instruction ?? (parameters.Side == Side.Buy ? "BUY" : "SELL"),
                         OrderType = orderType,
                         LimitPrice = RequiresLimitPrice(parameters.OrderTypeId) ? parameters.Price : null,
@@ -392,7 +461,7 @@ internal sealed class SchwabTradingVendor : Vendor
                 orderType,
                 RequiresLimitPrice(parameters.OrderTypeId) ? parameters.Price : null,
                 RequiresStopPrice(parameters.OrderTypeId) ? stopPrice : null,
-                parameters.Quantity,
+                shareQuantity,
                 ConvertTimeInForce(parameters.TimeInForce));
             this.RefreshOrdersInBackground();
 
@@ -442,9 +511,9 @@ internal sealed class SchwabTradingVendor : Vendor
             if (limitPrice <= 0)
                 return TradingOperationResult.CreateError(parameters.RequestId, "A valid limit price is required to close SCH TRD positions.");
 
-            var positions = client.GetPositionsAsync(parameters.CancellationToken)
+            var positions = this.FilterVisiblePositions(client.GetPositionsAsync(parameters.CancellationToken)
                 .GetAwaiter()
-                .GetResult();
+                .GetResult());
 
             var position = positions.FirstOrDefault(p =>
                 (string.IsNullOrWhiteSpace(accountId) || string.Equals(p.AccountHash, accountId, StringComparison.OrdinalIgnoreCase)) &&
@@ -454,8 +523,9 @@ internal sealed class SchwabTradingVendor : Vendor
             if (position == null || string.IsNullOrWhiteSpace(position.Symbol) || Math.Abs(position.Quantity) <= 0)
                 return TradingOperationResult.CreateError(parameters.RequestId, "No matching Schwab position was found to close.");
 
-            var quantityToClose = closeQuantity > 0
-                ? Math.Min(Math.Abs(position.Quantity), closeQuantity)
+            var closeShareQuantity = closeQuantity > 0 ? ToBrokerShareQuantity(closeQuantity) : 0d;
+            var quantityToClose = closeShareQuantity > 0
+                ? Math.Min(Math.Abs(position.Quantity), closeShareQuantity)
                 : Math.Abs(position.Quantity);
             if (quantityToClose <= 0 || quantityToClose % 1 != 0)
                 return TradingOperationResult.CreateError(parameters.RequestId, "SCH TRD allows whole-share close orders only.");
@@ -490,24 +560,27 @@ internal sealed class SchwabTradingVendor : Vendor
             return base.CalculatePnL(parameters);
 
         var openPrice = parameters.OpenPrice;
-        var quantity = parameters.Quantity;
         var side = parameters.Side;
+        BrokerPositionDto? cachedPosition = null;
 
-        if ((openPrice <= 0 || quantity <= 0) && this.TryResolvePositionForPnl(symbol, out var cachedPosition))
+        if (this.TryResolvePositionForPnl(symbol, out var resolvedPosition))
         {
+            cachedPosition = resolvedPosition;
             if (openPrice <= 0)
                 openPrice = cachedPosition.AveragePrice ?? 0d;
-            if (quantity <= 0)
-                quantity = Math.Abs(cachedPosition.Quantity);
             side = cachedPosition.Quantity >= 0 ? Side.Buy : Side.Sell;
         }
 
-        if (openPrice <= 0 || quantity <= 0)
+        var shareQuantity = cachedPosition != null
+            ? Math.Abs(cachedPosition.Quantity)
+            : Math.Abs(ToBrokerShareQuantity(parameters.Quantity));
+
+        if (openPrice <= 0 || shareQuantity <= 0)
             return base.CalculatePnL(parameters);
 
         var isShort = side == Side.Sell;
         var priceDifference = isShort ? openPrice - parameters.ClosePrice : parameters.ClosePrice - openPrice;
-        var value = priceDifference * Math.Abs(quantity);
+        var value = priceDifference * shareQuantity;
         var percent = isShort
             ? (openPrice - parameters.ClosePrice) / openPrice
             : (parameters.ClosePrice / openPrice) - 1d;
@@ -539,6 +612,7 @@ internal sealed class SchwabTradingVendor : Vendor
         return client.GetPositionsAsync(token)
             .GetAwaiter()
             .GetResult()
+            .Where(p => this.IsVisibleAccountHash(p.AccountHash))
             .Where(p => !string.IsNullOrWhiteSpace(p.Symbol))
             .Select(p => CreateMessageSymbol(p.Symbol))
             .GroupBy(s => s.Id, StringComparer.OrdinalIgnoreCase)
@@ -595,15 +669,18 @@ internal sealed class SchwabTradingVendor : Vendor
             HistoryType = HistoryType.Last,
             VolumeType = SymbolVolumeType.Volume,
             NettingType = NettingType.OnePosition,
-            QuotingType = SymbolQuotingType.LotSize,
+            // Quantower's B API is lot-based. US equities must use one share per lot so
+            // order quantities, position quantities, and account overlays are interpreted
+            // as actual shares instead of 100-share lots.
+            QuotingType = SymbolQuotingType.TickSizeTickCost,
             DeltaCalculationType = DeltaCalculationType.TickDirection,
-            VariableTickList = [new VariableTick(0.01)],
-            LotSize = 1d,
+            VariableTickList = [new VariableTick(0.01, 0.01, 2)],
+            LotSize = EquityLotSize,
             LotStep = 1d,
             NotionalValueStep = 1d,
             MinLot = 1d,
             MaxLot = int.MaxValue,
-            AllowCalculateRealtimeChange = false,
+            AllowCalculateRealtimeChange = true,
             AllowCalculateRealtimeVolume = false,
             AllowCalculateRealtimeTicks = false,
             AllowCalculateRealtimeTrades = false,
@@ -621,6 +698,7 @@ internal sealed class SchwabTradingVendor : Vendor
         var signedPosition = client.GetPositionsAsync(cancellationToken)
             .GetAwaiter()
             .GetResult()
+            .Where(p => this.IsVisibleAccountHash(p.AccountHash))
             .Where(p => string.Equals(p.AccountHash, accountId, StringComparison.OrdinalIgnoreCase) &&
                         string.Equals(NormalizeSymbolKey(p.Symbol), NormalizeSymbolKey(symbol), StringComparison.OrdinalIgnoreCase))
             .Sum(p => p.Quantity);
@@ -650,8 +728,8 @@ internal sealed class SchwabTradingVendor : Vendor
                 foreach (var delay in ActionRefreshScheduleMilliseconds)
                 {
                     await Task.Delay(TimeSpan.FromMilliseconds(delay), token).ConfigureAwait(false);
-                    var orders = await client.GetOrdersAsync(token).ConfigureAwait(false);
-                    if (this.PublishOrderChanges(orders))
+                    var orders = this.FilterVisibleOrders(await client.GetOrdersAsync(token).ConfigureAwait(false));
+                    if (this.PublishOrderChanges(orders, forceOpenOrderMessages: true))
                     {
                         await this.PublishRecentTradesAsync(client, token).ConfigureAwait(false);
                         await this.RefreshPositionsAsync(token).ConfigureAwait(false);
@@ -703,7 +781,7 @@ internal sealed class SchwabTradingVendor : Vendor
         if (client == null)
             return;
 
-        var positions = await client.GetPositionsAsync(token).ConfigureAwait(false);
+        var positions = this.FilterVisiblePositions(await client.GetPositionsAsync(token).ConfigureAwait(false));
         var messages = this.ReconcilePositions(positions, out var closeMessages);
 
         foreach (var message in closeMessages)
@@ -717,7 +795,7 @@ internal sealed class SchwabTradingVendor : Vendor
         var fromUtc = this.tradeTrackingStartedUtc == DateTime.MinValue
             ? DateTime.UtcNow.AddMinutes(-5)
             : this.tradeTrackingStartedUtc.AddSeconds(-10);
-        var trades = await client.GetTradesAsync(fromUtc, DateTime.UtcNow.AddSeconds(5), token).ConfigureAwait(false);
+        var trades = this.FilterVisibleTrades(await client.GetTradesAsync(fromUtc, DateTime.UtcNow.AddSeconds(5), token).ConfigureAwait(false));
 
         foreach (var trade in trades
             .Where(t => !string.IsNullOrWhiteSpace(t.TradeId) &&
@@ -947,7 +1025,7 @@ internal sealed class SchwabTradingVendor : Vendor
             AccountId = position.AccountHash,
             Side = position.Quantity >= 0 ? Side.Buy : Side.Sell,
             PositionId = $"{position.AccountHash}:{NormalizeSymbolKey(position.Symbol)}",
-            Quantity = Math.Abs(position.Quantity),
+            Quantity = ToQuantowerLotQuantity(Math.Abs(position.Quantity)),
             OpenPrice = position.AveragePrice ?? 0d,
             OpenTime = DateTime.UtcNow,
             Comment = position.Description ?? position.AssetType ?? string.Empty
@@ -956,8 +1034,8 @@ internal sealed class SchwabTradingVendor : Vendor
         var pnl = new PnLItem
         {
             AssetID = "USD",
-            Value = position.UnrealizedProfitLoss ?? 0d,
-            ValuePercent = 0d
+            Value = ResolvePositionPnlValue(position),
+            ValuePercent = ResolvePositionPnlPercent(position)
         };
         TrySetProperty(message, "GrossPnL", pnl);
         TrySetProperty(message, "NetPnL", pnl);
@@ -1000,7 +1078,7 @@ internal sealed class SchwabTradingVendor : Vendor
                 NameKey = loc.key("Unrealized P&L"),
                 DataType = ComparingType.Double,
                 FormatingType = AdditionalInfoItemFormatingType.AssetBalance,
-                Value = position.UnrealizedProfitLoss ?? 0d
+                Value = ResolvePositionPnlValue(position)
             },
             new()
             {
@@ -1018,18 +1096,48 @@ internal sealed class SchwabTradingVendor : Vendor
         return message;
     }
 
+    private static double ResolvePositionPnlValue(BrokerPositionDto position)
+    {
+        var averagePrice = position.AveragePrice ?? 0d;
+        var marketPrice = position.MarketPrice ?? 0d;
+        var quantity = Math.Abs(position.Quantity);
+
+        if (averagePrice > 0d && marketPrice > 0d && quantity > 0d)
+        {
+            var priceDifference = position.Quantity >= 0d
+                ? marketPrice - averagePrice
+                : averagePrice - marketPrice;
+            return priceDifference * quantity;
+        }
+
+        return position.UnrealizedProfitLoss ?? 0d;
+    }
+
+    private static double ResolvePositionPnlPercent(BrokerPositionDto position)
+    {
+        var averagePrice = position.AveragePrice ?? 0d;
+        var marketPrice = position.MarketPrice ?? 0d;
+
+        if (averagePrice <= 0d || marketPrice <= 0d)
+            return 0d;
+
+        return position.Quantity >= 0d
+            ? (marketPrice / averagePrice) - 1d
+            : (averagePrice - marketPrice) / averagePrice;
+    }
+
     private static MessageClosePosition CreateClosedPositionMessage(string positionId) => new() { PositionId = positionId };
 
     private static MessageOpenOrder CreateOpenOrder(BrokerOrderDto order)
     {
-        var filledQuantity = Math.Abs(order.FilledQuantity ?? 0d);
-        var totalQuantity = Math.Abs(order.Quantity ?? 0d);
+        var filledQuantity = ToQuantowerLotQuantity(Math.Abs(order.FilledQuantity ?? 0d));
+        var totalQuantity = ToQuantowerLotQuantity(Math.Abs(order.Quantity ?? 0d));
         var message = new MessageOpenOrder(NormalizeSymbolKey(order.Symbol ?? string.Empty))
         {
             AccountId = order.AccountHash,
             OrderId = order.OrderId,
             GroupId = ResolveOrderGroupId(order),
-            PositionId = GetOrderPositionId(order),
+            PositionId = ResolveOpenOrderPositionId(order),
             Price = order.Price ?? double.NaN,
             TriggerPrice = order.TriggerPrice ?? order.StopPrice ?? double.NaN,
             TrailOffset = order.TrailOffset ?? double.NaN,
@@ -1042,8 +1150,8 @@ internal sealed class SchwabTradingVendor : Vendor
             TotalQuantity = totalQuantity,
             FilledQuantity = filledQuantity,
             AverageFillPrice = filledQuantity > 0d ? order.AverageFillPrice ?? double.NaN : double.NaN,
-            LastUpdateTime = order.EnteredTime?.UtcDateTime ?? DateTime.UtcNow,
-            Comment = FormatInstructionLabel(order.Instruction),
+            LastUpdateTime = DateTime.UtcNow,
+            Comment = ResolveOpenOrderComment(order),
             AdditionalInfoItems = new List<AdditionalInfoItem>
             {
                 new()
@@ -1088,6 +1196,30 @@ internal sealed class SchwabTradingVendor : Vendor
 
         return $"{order.AccountHash}:{NormalizeSymbolKey(order.Symbol ?? string.Empty)}";
     }
+
+    private static string ResolveOpenOrderPositionId(BrokerOrderDto order)
+    {
+        // Match Quantower's native DOM behavior: plain DOM ladder orders should publish
+        // like IBKR LMT/STP orders with no position attachment. A PositionId makes QT
+        // classify them as TP/SL-style overlays (for example "Limit(TP for ...)").
+        if (!IsPositionAttachedOrder(order))
+            return string.Empty;
+
+        return GetOrderPositionId(order);
+    }
+
+    private static bool IsPositionAttachedOrder(BrokerOrderDto order)
+    {
+        var strategy = order.OrderStrategyType?.Trim();
+        if (!string.IsNullOrWhiteSpace(strategy) && !strategy.Equals("SINGLE", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var groupId = order.GroupId?.Trim();
+        return !string.IsNullOrWhiteSpace(groupId) && !groupId.Equals("SINGLE", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string ResolveOpenOrderComment(BrokerOrderDto order) =>
+        IsPositionAttachedOrder(order) ? FormatInstructionLabel(order.Instruction) : string.Empty;
 
     private static bool IsSupportedPlaceOrderType(string orderTypeId) =>
         string.Equals(orderTypeId, OrderType.Limit, StringComparison.OrdinalIgnoreCase) ||
@@ -1136,7 +1268,7 @@ internal sealed class SchwabTradingVendor : Vendor
             ? $"{trade.AccountHash}:{NormalizeSymbolKey(trade.Symbol)}"
             : trade.PositionId,
         Price = trade.Price,
-        Quantity = Math.Abs(trade.Quantity),
+        Quantity = ToQuantowerLotQuantity(Math.Abs(trade.Quantity)),
         DateTime = trade.ExecutedTime.UtcDateTime,
         Side = ConvertInstructionSide(trade.Instruction),
         OrderId = trade.OrderId,
@@ -1202,7 +1334,7 @@ internal sealed class SchwabTradingVendor : Vendor
             : TimeInForce.Day;
 
     private static string ConvertTimeInForce(TimeInForce tif) =>
-        tif == TimeInForce.GTC ? "GOOD_TILL_CANCEL" : "DAY";
+        tif == TimeInForce.GTC ? "GTC" : "DAY";
 
     private static string NormalizeSymbolKey(string symbol) => (symbol ?? string.Empty).Trim().ToUpperInvariant();
 
@@ -1258,6 +1390,12 @@ internal sealed class SchwabTradingVendor : Vendor
         var value = property?.GetValue(target);
         return value is TimeInForce timeInForce ? timeInForce : TimeInForce.Day;
     }
+
+    private static double ToBrokerShareQuantity(double quantowerLotQuantity) =>
+        Math.Round(quantowerLotQuantity, 6);
+
+    private static double ToQuantowerLotQuantity(double brokerShareQuantity) =>
+        brokerShareQuantity;
 
     private static void TrySetProperty(object target, string propertyName, object? value)
     {
