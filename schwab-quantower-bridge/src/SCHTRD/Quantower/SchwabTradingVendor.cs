@@ -1,4 +1,4 @@
-using System.Collections;
+﻿using System.Collections;
 using System.Reflection;
 using SchwabQuantowerBridge.Models;
 using SchwabQuantowerBridge.Services;
@@ -9,8 +9,9 @@ namespace SchwabQuantowerBridge.Quantower;
 
 internal sealed class SchwabTradingVendor : Vendor
 {
-    private const string ExchangeId = "24EQ";
-    private const double EquityLotSize = 1d;
+    private const string ExchangeId = "Composite";
+    private const string EquitySessionsContainerId = "US_EQUITIES_ETH";
+    private const double EquityLotSize = 100d;
     private const string ExcludedSchwabAccountNumberSuffix = "6462";
     private static readonly TimeSpan OrderPollingInterval = TimeSpan.FromSeconds(1);
     private static readonly int[] ActionRefreshScheduleMilliseconds = [100, 600, 1500];
@@ -351,6 +352,7 @@ internal sealed class SchwabTradingVendor : Vendor
 
     public override IList<OrderType> GetAllowedOrderTypes(CancellationToken token) =>
     [
+        new MarketOrderType(TimeInForce.Day, TimeInForce.GTC),
         new LimitOrderType(TimeInForce.Day, TimeInForce.GTC),
         new StopOrderType(TimeInForce.Day, TimeInForce.GTC),
         new StopLimitOrderType(TimeInForce.Day, TimeInForce.GTC)
@@ -362,7 +364,7 @@ internal sealed class SchwabTradingVendor : Vendor
         if (client == null)
             return TradingOperationResult.CreateError(parameters.RequestId, "Schwab backend is not connected.");
         if (!IsSupportedPlaceOrderType(parameters.OrderTypeId))
-            return TradingOperationResult.CreateError(parameters.RequestId, "SCH TRD supports LIMIT, STOP, and STOP_LIMIT orders only.");
+            return TradingOperationResult.CreateError(parameters.RequestId, "SCH TRD supports MARKET, LIMIT, STOP, and STOP_LIMIT orders only.");
         if (RequiresLimitPrice(parameters.OrderTypeId) && (double.IsNaN(parameters.Price) || parameters.Price <= 0))
             return TradingOperationResult.CreateError(parameters.RequestId, "Limit price is required.");
         var stopPrice = ResolveStopPrice(parameters);
@@ -421,7 +423,7 @@ internal sealed class SchwabTradingVendor : Vendor
         if (client == null)
             return TradingOperationResult.CreateError(parameters.RequestId, "Schwab backend is not connected.");
         if (!IsSupportedPlaceOrderType(parameters.OrderTypeId))
-            return TradingOperationResult.CreateError(parameters.RequestId, "SCH TRD supports LIMIT, STOP, and STOP_LIMIT order modification only.");
+            return TradingOperationResult.CreateError(parameters.RequestId, "SCH TRD supports MARKET, LIMIT, STOP, and STOP_LIMIT order modification only.");
         if (RequiresLimitPrice(parameters.OrderTypeId) && (double.IsNaN(parameters.Price) || parameters.Price <= 0))
             return TradingOperationResult.CreateError(parameters.RequestId, "A valid limit price is required.");
         var stopPrice = ResolveStopPrice(parameters);
@@ -502,26 +504,44 @@ internal sealed class SchwabTradingVendor : Vendor
 
         try
         {
-            var accountId = ResolveStringProperty(parameters, "Account") ?? ResolveStringProperty(parameters, "AccountId");
-            var positionId = ResolveStringProperty(parameters, "PositionId");
-            var symbolId = ResolveStringProperty(parameters, "Symbol") ?? ResolveStringProperty(parameters, "SymbolId");
+            var requestPosition = ResolveObjectProperty(parameters, "Position");
+            var accountId = ResolveStringProperty(parameters, "Account") ??
+                ResolveStringProperty(parameters, "AccountId") ??
+                ResolveStringProperty(requestPosition, "Account");
+            var positionId = ResolveStringProperty(parameters, "PositionId") ??
+                ResolveStringProperty(requestPosition, "Id");
+            var symbolId = ResolveStringProperty(parameters, "Symbol") ??
+                ResolveStringProperty(parameters, "SymbolId") ??
+                ResolveStringProperty(requestPosition, "Symbol");
             var limitPrice = ResolveFirstPositiveDoubleProperty(parameters, "Price", "ClosePrice", "LimitPrice");
             var closeQuantity = ResolveDoubleProperty(parameters, "CloseQuantity");
 
-            if (limitPrice <= 0)
-                return TradingOperationResult.CreateError(parameters.RequestId, "A valid limit price is required to close SCH TRD positions.");
+            if (string.IsNullOrWhiteSpace(positionId) && string.IsNullOrWhiteSpace(symbolId))
+                return TradingOperationResult.CreateError(parameters.RequestId, "SCH TRD close-position requests require a position or symbol.");
 
             var positions = this.FilterVisiblePositions(client.GetPositionsAsync(parameters.CancellationToken)
                 .GetAwaiter()
                 .GetResult());
 
+            var hasPositionId = !string.IsNullOrWhiteSpace(positionId);
+            var hasSymbolId = !string.IsNullOrWhiteSpace(symbolId);
             var position = positions.FirstOrDefault(p =>
                 (string.IsNullOrWhiteSpace(accountId) || string.Equals(p.AccountHash, accountId, StringComparison.OrdinalIgnoreCase)) &&
-                ((string.IsNullOrWhiteSpace(positionId) || string.Equals($"{p.AccountHash}:{NormalizeSymbolKey(p.Symbol)}", positionId, StringComparison.OrdinalIgnoreCase)) ||
-                 (!string.IsNullOrWhiteSpace(symbolId) && string.Equals(NormalizeSymbolKey(p.Symbol), NormalizeSymbolKey(symbolId), StringComparison.OrdinalIgnoreCase))));
+                ((hasPositionId && string.Equals($"{p.AccountHash}:{NormalizeSymbolKey(p.Symbol)}", positionId, StringComparison.OrdinalIgnoreCase)) ||
+                 (hasSymbolId && !string.IsNullOrWhiteSpace(symbolId) && string.Equals(NormalizeSymbolKey(p.Symbol), NormalizeSymbolKey(symbolId), StringComparison.OrdinalIgnoreCase))));
 
             if (position == null || string.IsNullOrWhiteSpace(position.Symbol) || Math.Abs(position.Quantity) <= 0)
                 return TradingOperationResult.CreateError(parameters.RequestId, "No matching Schwab position was found to close.");
+
+            if (limitPrice <= 0d)
+            {
+                limitPrice = ResolveCloseLimitPriceFromMappedQuote(parameters, position.Quantity > 0);
+                if (limitPrice <= 0d)
+                {
+                    var requiredSide = position.Quantity > 0 ? "Ask" : "Bid";
+                    return TradingOperationResult.CreateError(parameters.RequestId, $"SCH TRD close-position requires a limit price or a mapped dxFeed {requiredSide} quote.");
+                }
+            }
 
             var closeShareQuantity = closeQuantity > 0 ? ToBrokerShareQuantity(closeQuantity) : 0d;
             var quantityToClose = closeShareQuantity > 0
@@ -600,7 +620,38 @@ internal sealed class SchwabTradingVendor : Vendor
 
     public override IList<MessageExchange> GetExchanges(CancellationToken token) =>
     [
-        new MessageExchange { Id = ExchangeId, ExchangeName = "US Equities" }
+        new MessageExchange { Id = ExchangeId, ExchangeName = "Composite", SessionsContainerId = EquitySessionsContainerId }
+    ];
+
+    public override IList<MessageSessionsContainer> GetSessions(CancellationToken token) =>
+    [
+        new MessageSessionsContainer
+        {
+            Id = EquitySessionsContainerId,
+            Name = "US ETH",
+            Description = "US equities extended trading hours",
+            Holidays = [new HolidayInfo { Date = new DateTime(2026, 6, 19), Name = string.Empty }],
+            SessionsSets =
+            [
+                new SessionsSet
+                {
+                    Days =
+                    [
+                        DayOfWeek.Monday,
+                        DayOfWeek.Tuesday,
+                        DayOfWeek.Wednesday,
+                        DayOfWeek.Thursday,
+                        DayOfWeek.Friday
+                    ],
+                    Sessions =
+                    [
+                        new Session("US ETH", TimeSpan.FromHours(8), new TimeSpan(13, 30, 0), SessionType.PreMarket, false),
+                        new Session("US ETH", new TimeSpan(13, 30, 0), TimeSpan.FromHours(20), SessionType.Main, true),
+                        new Session("US ETH", TimeSpan.FromHours(20), TimeSpan.FromHours(24), SessionType.PostMarket, false)
+                    ]
+                }
+            ]
+        }
     ];
 
     public override IList<MessageSymbol> GetSymbols(CancellationToken token)
@@ -644,14 +695,13 @@ internal sealed class SchwabTradingVendor : Vendor
 
     public override void SubscribeSymbol(SubscribeQuotesParameters parameters)
     {
-        this.PublishTradingSnapshotForSymbol(parameters.SymbolId);
     }
 
     public override void UnSubscribeSymbol(SubscribeQuotesParameters parameters)
     {
     }
 
-    public override HistoryMetadata GetHistoryMetadata(CancellationToken cancelationToken) => new();
+    public override HistoryMetadata GetHistoryMetadata(CancellationToken cancelationToken) => CreateNoHistoryMetadata();
 
     public override IList<IHistoryItem> LoadHistory(HistoryRequestParameters requestParameters) => [];
 
@@ -666,28 +716,54 @@ internal sealed class SchwabTradingVendor : Vendor
             QuotingCurrencyAssetID = "USD",
             SymbolType = SymbolType.Equities,
             ExchangeId = ExchangeId,
-            HistoryType = HistoryType.Last,
-            VolumeType = SymbolVolumeType.Volume,
-            NettingType = NettingType.OnePosition,
-            // Quantower's B API is lot-based. US equities must use one share per lot so
-            // order quantities, position quantities, and account overlays are interpreted
-            // as actual shares instead of 100-share lots.
-            QuotingType = SymbolQuotingType.TickSizeTickCost,
-            DeltaCalculationType = DeltaCalculationType.TickDirection,
+            SessionsContainerId = EquitySessionsContainerId,
+            VolumeType = SymbolVolumeType.Disable,
+            QuotingType = SymbolQuotingType.LotSize,
             VariableTickList = [new VariableTick(0.01, 0.01, 2)],
             LotSize = EquityLotSize,
-            LotStep = 1d,
             NotionalValueStep = 1d,
-            MinLot = 1d,
-            MaxLot = int.MaxValue,
-            AllowCalculateRealtimeChange = true,
-            AllowCalculateRealtimeVolume = false,
-            AllowCalculateRealtimeTicks = false,
-            AllowCalculateRealtimeTrades = false,
             AllowAbbreviatePriceByTickSize = true,
-            AvailableOptions = AvailableDerivatives.None
+            AvailableOptions = AvailableDerivatives.None,
+            SymbolAdditionalInfo =
+            [
+                new AdditionalInfoItem
+                {
+                    GroupInfo = "General",
+                    Id = "Country",
+                    NameKey = loc.key("Country"),
+                    ToolTipKey = loc.key("Country"),
+                    DataType = ComparingType.String,
+                    Value = "US",
+                    SortIndex = 100
+                },
+                new AdditionalInfoItem
+                {
+                    GroupInfo = "General",
+                    Id = "Classification of Financial",
+                    NameKey = loc.key("Classification of Financial"),
+                    ToolTipKey = loc.key("Classification of Financial"),
+                    DataType = ComparingType.String,
+                    Value = "ESXXXX",
+                    SortIndex = 110
+                }
+            ]
         };
     }
+
+    private static HistoryMetadata CreateNoHistoryMetadata() => new()
+    {
+        AllowedAggregations = [],
+        AllowedPeriodsHistoryAggregationTime = [],
+        AllowedBasePeriodsHistoryAggregationTime = [],
+        AllowedHistoryTypesHistoryAggregationTime = [],
+        AllowedHistoryTypesHistoryAggregationTick = [],
+        AllowedPeriodsHistoryAggregationTimeStatistics = [],
+        AllowedBasePeriodsHistoryAggregationTimeStatistics = [],
+        DegreeOfParallelism = 1,
+        UseHistoryLocalCache = false,
+        BuildUncompletedBars = false,
+        ServerSideTickDirectionAvailable = false
+    };
 
     private string ResolveInstruction(string accountId, string symbol, Side side, CancellationToken cancellationToken)
     {
@@ -1222,6 +1298,7 @@ internal sealed class SchwabTradingVendor : Vendor
         IsPositionAttachedOrder(order) ? FormatInstructionLabel(order.Instruction) : string.Empty;
 
     private static bool IsSupportedPlaceOrderType(string orderTypeId) =>
+        string.Equals(orderTypeId, OrderType.Market, StringComparison.OrdinalIgnoreCase) ||
         string.Equals(orderTypeId, OrderType.Limit, StringComparison.OrdinalIgnoreCase) ||
         string.Equals(orderTypeId, OrderType.Stop, StringComparison.OrdinalIgnoreCase) ||
         string.Equals(orderTypeId, OrderType.StopLimit, StringComparison.OrdinalIgnoreCase);
@@ -1229,6 +1306,7 @@ internal sealed class SchwabTradingVendor : Vendor
     private static string ConvertOrderTypeId(string orderTypeId) =>
         string.Equals(orderTypeId, OrderType.StopLimit, StringComparison.OrdinalIgnoreCase) ? "STOP_LIMIT" :
         string.Equals(orderTypeId, OrderType.Stop, StringComparison.OrdinalIgnoreCase) ? "STOP" :
+        string.Equals(orderTypeId, OrderType.Market, StringComparison.OrdinalIgnoreCase) ? "MARKET" :
         "LIMIT";
 
     private static string ConvertSchwabOrderType(string? orderType) =>
@@ -1338,10 +1416,9 @@ internal sealed class SchwabTradingVendor : Vendor
 
     private static string NormalizeSymbolKey(string symbol) => (symbol ?? string.Empty).Trim().ToUpperInvariant();
 
-    private static string? ResolveStringProperty(object target, string propertyName)
+    private static string? ResolveStringProperty(object? target, string propertyName)
     {
-        var property = target.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
-        var value = property?.GetValue(target);
+        var value = ResolveObjectProperty(target, propertyName);
         if (value == null)
             return null;
 
@@ -1352,6 +1429,15 @@ internal sealed class SchwabTradingVendor : Vendor
             Symbol symbol => symbol.Id,
             _ => ResolveStringProperty(value, "Id")
         };
+    }
+
+    private static object? ResolveObjectProperty(object? target, string propertyName)
+    {
+        if (target == null)
+            return null;
+
+        var property = target.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
+        return property?.GetValue(target);
     }
 
     private static double ResolveDoubleProperty(object target, string propertyName)
@@ -1384,6 +1470,17 @@ internal sealed class SchwabTradingVendor : Vendor
         return 0d;
     }
 
+    private static double ResolveCloseLimitPriceFromMappedQuote(ClosePositionRequestParameters parameters, bool closingLong)
+    {
+        var symbol = ResolveObjectProperty(parameters, "Symbol") ??
+            ResolveObjectProperty(ResolveObjectProperty(parameters, "Position"), "Symbol");
+        if (symbol == null)
+            return 0d;
+
+        return closingLong
+            ? ResolveFirstPositiveDoubleProperty(symbol, "Ask")
+            : ResolveFirstPositiveDoubleProperty(symbol, "Bid");
+    }
     private static TimeInForce ResolveTimeInForceProperty(object target, string propertyName)
     {
         var property = target.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
@@ -1402,3 +1499,6 @@ internal sealed class SchwabTradingVendor : Vendor
         target.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public)?.SetValue(target, value);
     }
 }
+
+
+

@@ -63,6 +63,9 @@ public sealed class SchwabVendor : Vendor
 
     public override IList<MessageExchange> GetExchanges(System.Threading.CancellationToken token) => this.currentVendor?.GetExchanges(token) ?? new List<MessageExchange>();
 
+    public override IList<MessageSessionsContainer> GetSessions(System.Threading.CancellationToken token) =>
+        this.currentVendor?.GetSessions(token) ?? new List<MessageSessionsContainer>();
+
     public override bool AllowNonFixedList => true;
 
     public override MessageSymbol GetNonFixedSymbol(GetSymbolRequestParameters requestParameters) =>
@@ -82,13 +85,6 @@ public sealed class SchwabVendor : Vendor
 
     public override void SubscribeSymbol(SubscribeQuotesParameters parameters)
     {
-        // SCH TRD must not publish quotes, tape, DOM, or history. Quantower symbol
-        // mapping should source all market data from dxFeed while this connector
-        // remains responsible for account, position, order, and trading messages.
-        //
-        // Quantower calls this hook when panels bind to a symbol. SCH TRD uses it
-        // only to republish cached account-side overlays for that symbol.
-        this.currentVendor?.SubscribeSymbol(parameters);
     }
 
     public override void UnSubscribeSymbol(SubscribeQuotesParameters parameters)
@@ -96,7 +92,20 @@ public sealed class SchwabVendor : Vendor
     }
 
     public override HistoryMetadata GetHistoryMetadata(System.Threading.CancellationToken cancelationToken) =>
-        new HistoryMetadata();
+        this.currentVendor?.GetHistoryMetadata(cancelationToken) ?? new HistoryMetadata
+        {
+            AllowedAggregations = [],
+            AllowedPeriodsHistoryAggregationTime = [],
+            AllowedBasePeriodsHistoryAggregationTime = [],
+            AllowedHistoryTypesHistoryAggregationTime = [],
+            AllowedHistoryTypesHistoryAggregationTick = [],
+            AllowedPeriodsHistoryAggregationTimeStatistics = [],
+            AllowedBasePeriodsHistoryAggregationTimeStatistics = [],
+            DegreeOfParallelism = 1,
+            UseHistoryLocalCache = false,
+            BuildUncompletedBars = false,
+            ServerSideTickDirectionAvailable = false
+        };
 
     public override IList<IHistoryItem> LoadHistory(HistoryRequestParameters requestParameters) =>
         new List<IHistoryItem>();
