@@ -401,10 +401,19 @@ class SchwabBrokerService:
             raise ValueError(f"Order {request.order_id} is not active/cancelable and cannot be modified")
 
         if str(current_order.get("orderType") or "").upper() not in {"LIMIT", "STOP", "STOP_LIMIT"}:
-            raise ValueError("Only LIMIT, STOP, and STOP_LIMIT order modifications are supported in the Schwab bridge")
+            raise ValueError("Only active LIMIT, STOP, and STOP_LIMIT orders can be modified in the Schwab bridge")
 
         if request.quantity != int(request.quantity):
             raise ValueError("Fractional share modifications are disabled for Schwab bridge trading")
+
+        if request.order_type not in {"LIMIT", "MARKET", "STOP", "STOP_LIMIT"}:
+            raise ValueError("Only LIMIT, MARKET, STOP, and STOP_LIMIT order modifications are enabled for Schwab bridge trading")
+
+        if request.order_type in {"LIMIT", "STOP_LIMIT"} and request.limit_price is None:
+            raise ValueError("limit_price is required")
+
+        if request.order_type in {"STOP", "STOP_LIMIT"} and request.stop_price is None:
+            raise ValueError("stop_price is required")
 
 
     def _audit(self, action: str, account_hash: str, request: EquityOrderRequest | None, result: dict[str, object]) -> None:
@@ -652,6 +661,8 @@ def _build_equity_order(
 
     resolved_duration = duration or Duration.DAY
     resolved_session = session or (Session.SEAMLESS if settings.schwab_extended_hours_enabled else Session.NORMAL)
+    if request.order_type != "LIMIT":
+        resolved_session = Session.NORMAL
     order.set_duration(resolved_duration)
     order.set_session(resolved_session)
 
@@ -666,6 +677,8 @@ def _build_equity_order_with_protection(
 ):
     resolved_duration = duration or Duration.DAY
     resolved_session = session or (Session.SEAMLESS if settings.schwab_extended_hours_enabled else Session.NORMAL)
+    if request.order_type != "LIMIT":
+        resolved_session = Session.NORMAL
     entry_order = _build_base_equity_order(
         symbol=request.symbol.upper(),
         quantity=request.quantity,

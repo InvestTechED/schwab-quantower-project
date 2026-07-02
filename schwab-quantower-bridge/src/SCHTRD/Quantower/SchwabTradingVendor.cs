@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using System.Reflection;
 using SchwabQuantowerBridge.Models;
 using SchwabQuantowerBridge.Services;
@@ -20,12 +20,10 @@ internal sealed class SchwabTradingVendor : Vendor
     private readonly Dictionary<string, BrokerPositionDto> positionCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> excludedAccountIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> closedPositionMessagesPushed = new(StringComparer.OrdinalIgnoreCase);
-    private readonly HashSet<string> tradeMessagesPushed = new(StringComparer.OrdinalIgnoreCase);
     private readonly object syncRoot = new();
     private SchwabTradingBackendClient? backendClient;
     private CancellationTokenSource? orderPollingCts;
     private bool connected;
-    private DateTime tradeTrackingStartedUtc = DateTime.MinValue;
 
     public override ConnectionResult Connect(ConnectRequestParameters connectRequestParameters)
     {
@@ -39,7 +37,6 @@ internal sealed class SchwabTradingVendor : Vendor
 
             this.RefreshAccountFilter(connectRequestParameters.CancellationToken);
             this.connected = true;
-            this.tradeTrackingStartedUtc = DateTime.UtcNow;
             this.StartOrderPolling();
             return ConnectionResult.CreateSuccess();
         }
@@ -57,8 +54,6 @@ internal sealed class SchwabTradingVendor : Vendor
             this.positionCache.Clear();
             this.excludedAccountIds.Clear();
             this.closedPositionMessagesPushed.Clear();
-            this.tradeMessagesPushed.Clear();
-            this.tradeTrackingStartedUtc = DateTime.MinValue;
             this.connected = false;
         }
 
@@ -217,9 +212,6 @@ internal sealed class SchwabTradingVendor : Vendor
     private List<BrokerPositionDto> FilterVisiblePositions(IEnumerable<BrokerPositionDto> positions) =>
         positions.Where(p => this.IsVisibleAccountHash(p.AccountHash)).ToList();
 
-    private List<BrokerTradeDto> FilterVisibleTrades(IEnumerable<BrokerTradeDto> trades) =>
-        trades.Where(t => this.IsVisibleAccountHash(t.AccountHash)).ToList();
-
     private void StartOrderPolling()
     {
         if (this.orderPollingCts != null)
@@ -254,7 +246,6 @@ internal sealed class SchwabTradingVendor : Vendor
                 var orders = this.FilterVisibleOrders(await client.GetOrdersAsync(token).ConfigureAwait(false));
                 if (this.PublishOrderChanges(orders))
                 {
-                    await this.PublishRecentTradesAsync(client, token).ConfigureAwait(false);
                     await this.RefreshPositionsAsync(token).ConfigureAwait(false);
                 }
             }
@@ -278,7 +269,7 @@ internal sealed class SchwabTradingVendor : Vendor
         }
     }
 
-    private bool PublishOrderChanges(IReadOnlyList<BrokerOrderDto> orders, bool forceOpenOrderMessages = false)
+    private bool PublishOrderChanges(IReadOnlyList<BrokerOrderDto> orders)
     {
         var openOrders = orders
             .Where(o => !string.IsNullOrWhiteSpace(o.OrderId) && !string.IsNullOrWhiteSpace(o.Symbol) && IsCancelableOrderStatus(o.Status))
@@ -297,7 +288,7 @@ internal sealed class SchwabTradingVendor : Vendor
             var isNewOrder = !previous.TryGetValue(order.OrderId!, out var previousOrder);
             var hasOrderChanged = !isNewOrder && HasOrderChanged(previousOrder!, order);
 
-            if (isNewOrder || hasOrderChanged || forceOpenOrderMessages)
+            if (isNewOrder || hasOrderChanged)
             {
                 this.PushMessage(CreateOpenOrder(order));
 
@@ -316,39 +307,23 @@ internal sealed class SchwabTradingVendor : Vendor
     }
 
     private static bool HasOrderChanged(BrokerOrderDto previous, BrokerOrderDto current) =>
-        !string.Equals(previous.Status, current.Status, StringComparison.OrdinalIgnoreCase) ||
-        !string.Equals(previous.Symbol, current.Symbol, StringComparison.OrdinalIgnoreCase) ||
-        !string.Equals(previous.Instruction, current.Instruction, StringComparison.OrdinalIgnoreCase) ||
+        ConvertOrderStatus(previous.Status) != ConvertOrderStatus(current.Status) ||
+        !string.Equals(NormalizeSymbolKey(previous.Symbol ?? string.Empty), NormalizeSymbolKey(current.Symbol ?? string.Empty), StringComparison.OrdinalIgnoreCase) ||
+        ConvertInstructionSide(previous.Instruction) != ConvertInstructionSide(current.Instruction) ||
+        !string.Equals(ConvertSchwabOrderType(previous.OrderType), ConvertSchwabOrderType(current.OrderType), StringComparison.OrdinalIgnoreCase) ||
+        ConvertTimeInForce(previous.Duration) != ConvertTimeInForce(current.Duration) ||
         Math.Abs((previous.Quantity ?? 0d) - (current.Quantity ?? 0d)) > 0.000001 ||
         Math.Abs((previous.FilledQuantity ?? 0d) - (current.FilledQuantity ?? 0d)) > 0.000001 ||
         Math.Abs((previous.RemainingQuantity ?? 0d) - (current.RemainingQuantity ?? 0d)) > 0.000001 ||
         Math.Abs((previous.Price ?? 0d) - (current.Price ?? 0d)) > 0.000001 ||
-        previous.EnteredTime != current.EnteredTime;
+        Math.Abs((previous.StopPrice ?? previous.TriggerPrice ?? 0d) - (current.StopPrice ?? current.TriggerPrice ?? 0d)) > 0.000001 ||
+        !string.Equals(ResolveOrderGroupId(previous), ResolveOrderGroupId(current), StringComparison.OrdinalIgnoreCase) ||
+        !string.Equals(ResolveOpenOrderPositionId(previous), ResolveOpenOrderPositionId(current), StringComparison.OrdinalIgnoreCase);
 
     private static bool HasFillStateChanged(BrokerOrderDto previous, BrokerOrderDto current) =>
         Math.Abs((previous.FilledQuantity ?? 0d) - (current.FilledQuantity ?? 0d)) > 0.000001 ||
         Math.Abs((previous.RemainingQuantity ?? 0d) - (current.RemainingQuantity ?? 0d)) > 0.000001 ||
         IsTerminalOrderStatus(current.Status);
-
-    public override TradesHistoryMetadata GetTradesMetadata() => new()
-    {
-        AllowLocalStorage = true
-    };
-
-    public override IList<MessageTrade> GetTrades(TradesHistoryRequestParameters parameters)
-    {
-        var client = this.backendClient;
-        if (client == null)
-            return [];
-
-        return client.GetTradesAsync(parameters.From, parameters.To, parameters.CancellationToken)
-            .GetAwaiter()
-            .GetResult()
-            .Where(t => this.IsVisibleAccountHash(t.AccountHash) && !string.IsNullOrWhiteSpace(t.Symbol) && t.Quantity > 0 && t.Price > 0)
-            .Select(CreateTrade)
-            .OrderBy(t => t.DateTime)
-            .ToList();
-    }
 
     public override IList<OrderType> GetAllowedOrderTypes(CancellationToken token) =>
     [
@@ -513,7 +488,6 @@ internal sealed class SchwabTradingVendor : Vendor
             var symbolId = ResolveStringProperty(parameters, "Symbol") ??
                 ResolveStringProperty(parameters, "SymbolId") ??
                 ResolveStringProperty(requestPosition, "Symbol");
-            var limitPrice = ResolveFirstPositiveDoubleProperty(parameters, "Price", "ClosePrice", "LimitPrice");
             var closeQuantity = ResolveDoubleProperty(parameters, "CloseQuantity");
 
             if (string.IsNullOrWhiteSpace(positionId) && string.IsNullOrWhiteSpace(symbolId))
@@ -533,14 +507,11 @@ internal sealed class SchwabTradingVendor : Vendor
             if (position == null || string.IsNullOrWhiteSpace(position.Symbol) || Math.Abs(position.Quantity) <= 0)
                 return TradingOperationResult.CreateError(parameters.RequestId, "No matching Schwab position was found to close.");
 
+            var limitPrice = ResolveCloseLimitPriceFromMappedQuote(parameters, position.Quantity > 0);
             if (limitPrice <= 0d)
             {
-                limitPrice = ResolveCloseLimitPriceFromMappedQuote(parameters, position.Quantity > 0);
-                if (limitPrice <= 0d)
-                {
-                    var requiredSide = position.Quantity > 0 ? "Ask" : "Bid";
-                    return TradingOperationResult.CreateError(parameters.RequestId, $"SCH TRD close-position requires a limit price or a mapped dxFeed {requiredSide} quote.");
-                }
+                var requiredSide = position.Quantity > 0 ? "Ask" : "Bid";
+                return TradingOperationResult.CreateError(parameters.RequestId, $"SCH TRD close-position requires a mapped dxFeed {requiredSide} quote.");
             }
 
             var closeShareQuantity = closeQuantity > 0 ? ToBrokerShareQuantity(closeQuantity) : 0d;
@@ -717,7 +688,7 @@ internal sealed class SchwabTradingVendor : Vendor
             SymbolType = SymbolType.Equities,
             ExchangeId = ExchangeId,
             SessionsContainerId = EquitySessionsContainerId,
-            VolumeType = SymbolVolumeType.Disable,
+            VolumeType = SymbolVolumeType.Volume,
             QuotingType = SymbolQuotingType.LotSize,
             VariableTickList = [new VariableTick(0.01, 0.01, 2)],
             LotSize = EquityLotSize,
@@ -805,9 +776,8 @@ internal sealed class SchwabTradingVendor : Vendor
                 {
                     await Task.Delay(TimeSpan.FromMilliseconds(delay), token).ConfigureAwait(false);
                     var orders = this.FilterVisibleOrders(await client.GetOrdersAsync(token).ConfigureAwait(false));
-                    if (this.PublishOrderChanges(orders, forceOpenOrderMessages: true))
+                    if (this.PublishOrderChanges(orders))
                     {
-                        await this.PublishRecentTradesAsync(client, token).ConfigureAwait(false);
                         await this.RefreshPositionsAsync(token).ConfigureAwait(false);
                     }
                 }
@@ -820,35 +790,6 @@ internal sealed class SchwabTradingVendor : Vendor
                 // Background reconciliation must never block or fail the user-initiated order action.
             }
         }, token);
-    }
-
-    private void PublishTradingSnapshotForSymbol(string? symbolId)
-    {
-        var normalizedSymbol = NormalizeSymbolKey(symbolId ?? string.Empty);
-        if (string.IsNullOrWhiteSpace(normalizedSymbol))
-            return;
-
-        List<BrokerPositionDto> positions;
-        List<BrokerOrderDto> orders;
-
-        lock (this.syncRoot)
-        {
-            positions = this.positionCache.Values
-                .Where(p => string.Equals(NormalizeSymbolKey(p.Symbol), normalizedSymbol, StringComparison.OrdinalIgnoreCase) &&
-                            Math.Abs(p.Quantity) > 0)
-                .ToList();
-
-            orders = this.orderCache.Values
-                .Where(o => string.Equals(NormalizeSymbolKey(o.Symbol ?? string.Empty), normalizedSymbol, StringComparison.OrdinalIgnoreCase) &&
-                            IsCancelableOrderStatus(o.Status))
-                .ToList();
-        }
-
-        foreach (var position in positions)
-            this.PushMessage(CreatePosition(position));
-
-        foreach (var order in orders)
-            this.PushMessage(CreateOpenOrder(order));
     }
 
     private async Task RefreshPositionsAsync(CancellationToken token)
@@ -864,30 +805,6 @@ internal sealed class SchwabTradingVendor : Vendor
             this.PushMessage(message);
         foreach (var message in messages)
             this.PushMessage(message);
-    }
-
-    private async Task PublishRecentTradesAsync(SchwabTradingBackendClient client, CancellationToken token)
-    {
-        var fromUtc = this.tradeTrackingStartedUtc == DateTime.MinValue
-            ? DateTime.UtcNow.AddMinutes(-5)
-            : this.tradeTrackingStartedUtc.AddSeconds(-10);
-        var trades = this.FilterVisibleTrades(await client.GetTradesAsync(fromUtc, DateTime.UtcNow.AddSeconds(5), token).ConfigureAwait(false));
-
-        foreach (var trade in trades
-            .Where(t => !string.IsNullOrWhiteSpace(t.TradeId) &&
-                        !string.IsNullOrWhiteSpace(t.Symbol) &&
-                        t.Quantity > 0 &&
-                        t.Price > 0)
-            .OrderBy(t => t.ExecutedTime))
-        {
-            lock (this.syncRoot)
-            {
-                if (!this.tradeMessagesPushed.Add(trade.TradeId))
-                    continue;
-            }
-
-            this.PushMessage(CreateTrade(trade));
-        }
     }
 
     private List<MessageOpenPosition> ReconcilePositions(IReadOnlyList<BrokerPositionDto> positions, out List<MessageClosePosition> closeMessages)
@@ -1337,22 +1254,6 @@ internal sealed class SchwabTradingVendor : Vendor
         return !double.IsNaN(parameters.Price) && parameters.Price > 0 ? parameters.Price : 0d;
     }
 
-    private static MessageTrade CreateTrade(BrokerTradeDto trade) => new()
-    {
-        TradeId = trade.TradeId,
-        SymbolId = NormalizeSymbolKey(trade.Symbol),
-        AccountId = trade.AccountHash,
-        PositionId = string.IsNullOrWhiteSpace(trade.PositionId)
-            ? $"{trade.AccountHash}:{NormalizeSymbolKey(trade.Symbol)}"
-            : trade.PositionId,
-        Price = trade.Price,
-        Quantity = ToQuantowerLotQuantity(Math.Abs(trade.Quantity)),
-        DateTime = trade.ExecutedTime.UtcDateTime,
-        Side = ConvertInstructionSide(trade.Instruction),
-        OrderId = trade.OrderId,
-        OrderTypeId = OrderType.Market
-    };
-
     private static Side ConvertInstructionSide(string? instruction)
     {
         var normalized = (instruction ?? string.Empty).Trim().ToUpperInvariant();
@@ -1436,14 +1337,18 @@ internal sealed class SchwabTradingVendor : Vendor
         if (target == null)
             return null;
 
-        var property = target.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
-        return property?.GetValue(target);
+        var type = target.GetType();
+        var property = type.GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
+        if (property != null)
+            return property.GetValue(target);
+
+        var field = type.GetField(propertyName, BindingFlags.Instance | BindingFlags.Public);
+        return field?.GetValue(target);
     }
 
     private static double ResolveDoubleProperty(object target, string propertyName)
     {
-        var property = target.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
-        var value = property?.GetValue(target);
+        var value = ResolveObjectProperty(target, propertyName);
         if (value == null)
             return 0d;
 
@@ -1481,6 +1386,7 @@ internal sealed class SchwabTradingVendor : Vendor
             ? ResolveFirstPositiveDoubleProperty(symbol, "Ask")
             : ResolveFirstPositiveDoubleProperty(symbol, "Bid");
     }
+
     private static TimeInForce ResolveTimeInForceProperty(object target, string propertyName)
     {
         var property = target.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
@@ -1489,10 +1395,10 @@ internal sealed class SchwabTradingVendor : Vendor
     }
 
     private static double ToBrokerShareQuantity(double quantowerLotQuantity) =>
-        Math.Round(quantowerLotQuantity, 6);
+        Math.Round(quantowerLotQuantity * EquityLotSize, 6);
 
     private static double ToQuantowerLotQuantity(double brokerShareQuantity) =>
-        brokerShareQuantity;
+        brokerShareQuantity / EquityLotSize;
 
     private static void TrySetProperty(object target, string propertyName, object? value)
     {

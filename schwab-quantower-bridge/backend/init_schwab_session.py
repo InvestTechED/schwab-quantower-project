@@ -1,4 +1,4 @@
-"""
+﻿"""
 Create or refresh a Schwab token for the Schwab Quantower bridge backend.
 
 Run this after installing backend dependencies:
@@ -18,6 +18,12 @@ def main() -> None:
         action="store_true",
         help="Back up any existing token and run the browser-assisted Schwab login flow."
     )
+    parser.add_argument(
+        "--callback-timeout",
+        type=float,
+        default=300.0,
+        help="Seconds to wait for the Schwab browser callback. Use 0 to wait indefinitely."
+    )
     args = parser.parse_args()
 
     service = SchwabAuthService()
@@ -26,7 +32,7 @@ def main() -> None:
         if backup_path is not None:
             print(f"Existing token backed up to: {backup_path}")
         print("Starting browser-assisted Schwab login flow...")
-        client = service.create_client_via_login_flow()
+        client = service.create_client_via_login_flow(callback_timeout=args.callback_timeout)
     else:
         client = service.create_client()
 
@@ -37,3 +43,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

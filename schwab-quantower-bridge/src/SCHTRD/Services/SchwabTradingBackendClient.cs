@@ -60,19 +60,6 @@ public sealed class SchwabTradingBackendClient
         return orders ?? [];
     }
 
-    public async Task<IReadOnlyList<BrokerTradeDto>> GetTradesAsync(
-        DateTime from,
-        DateTime to,
-        CancellationToken cancellationToken = default)
-    {
-        var trades = await this.httpClient.GetFromJsonAsync<List<BrokerTradeDto>>(
-            $"{BackendBaseUrl}/api/broker/trades?from_time={Uri.EscapeDataString(from.ToUniversalTime().ToString("O"))}&to_time={Uri.EscapeDataString(to.ToUniversalTime().ToString("O"))}",
-            JsonOptions,
-            cancellationToken);
-
-        return trades ?? [];
-    }
-
     public async Task<BrokerOrderResultDto?> PlaceOrderAsync(
         PlaceBrokerOrderRequestDto request,
         CancellationToken cancellationToken = default)

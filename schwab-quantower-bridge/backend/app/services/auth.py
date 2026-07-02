@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 import os
 from datetime import datetime, UTC
 
@@ -58,7 +58,7 @@ class SchwabAuthService:
         self.token_path.replace(backup_path)
         return backup_path
 
-    def create_client_via_login_flow(self):
+    def create_client_via_login_flow(self, callback_timeout: float = 300.0):
         if not SCHWAB_AUTH_AVAILABLE:
             raise RuntimeError("schwab-py is not installed")
         if not settings.has_schwab_credentials:
@@ -72,7 +72,8 @@ class SchwabAuthService:
             settings.schwab_app_secret,
             settings.schwab_callback_url,
             str(self.token_path),
-            interactive=False
+            interactive=False,
+            callback_timeout=callback_timeout
         )
         return self._configure_client(client)
 
@@ -100,3 +101,4 @@ class SchwabAuthService:
             f"Schwab token file is missing at {self.token_path}. "
             "Run the login flow manually to create a fresh token."
         )
+
