@@ -13,8 +13,7 @@ internal sealed class SchwabTradingVendor : Vendor
     private const string EquitySessionsContainerId = "US_EQUITIES_ETH";
     private const double EquityLotSize = 100d;
     private const string ExcludedSchwabAccountNumberSuffix = "6462";
-    private static readonly TimeSpan OrderPollingInterval = TimeSpan.FromSeconds(1);
-    private static readonly int[] ActionRefreshScheduleMilliseconds = [100, 600, 1500];
+    private static readonly TimeSpan OrderStreamReconnectDelay = TimeSpan.FromSeconds(1);
     private readonly HttpClient httpClient = new();
     private readonly Dictionary<string, BrokerOrderDto> orderCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, BrokerPositionDto> positionCache = new(StringComparer.OrdinalIgnoreCase);
@@ -22,7 +21,7 @@ internal sealed class SchwabTradingVendor : Vendor
     private readonly HashSet<string> closedPositionMessagesPushed = new(StringComparer.OrdinalIgnoreCase);
     private readonly object syncRoot = new();
     private SchwabTradingBackendClient? backendClient;
-    private CancellationTokenSource? orderPollingCts;
+    private CancellationTokenSource? orderStreamCts;
     private bool connected;
 
     public override ConnectionResult Connect(ConnectRequestParameters connectRequestParameters)
@@ -37,7 +36,7 @@ internal sealed class SchwabTradingVendor : Vendor
 
             this.RefreshAccountFilter(connectRequestParameters.CancellationToken);
             this.connected = true;
-            this.StartOrderPolling();
+            this.StartOrderStream();
             return ConnectionResult.CreateSuccess();
         }
         catch (Exception ex)
@@ -57,7 +56,7 @@ internal sealed class SchwabTradingVendor : Vendor
             this.connected = false;
         }
 
-        this.StopOrderPolling();
+        this.StopOrderStream();
         base.Disconnect();
     }
 
@@ -65,7 +64,7 @@ internal sealed class SchwabTradingVendor : Vendor
     {
         base.OnConnected(token);
         this.PushAccountSnapshot(token);
-        this.StartOrderPolling();
+        this.StartOrderStream();
     }
 
     public override PingResult Ping() => new()
@@ -212,9 +211,9 @@ internal sealed class SchwabTradingVendor : Vendor
     private List<BrokerPositionDto> FilterVisiblePositions(IEnumerable<BrokerPositionDto> positions) =>
         positions.Where(p => this.IsVisibleAccountHash(p.AccountHash)).ToList();
 
-    private void StartOrderPolling()
+    private void StartOrderStream()
     {
-        if (this.orderPollingCts != null)
+        if (this.orderStreamCts != null)
             return;
 
         var client = this.backendClient;
@@ -222,14 +221,14 @@ internal sealed class SchwabTradingVendor : Vendor
             return;
 
         var cts = new CancellationTokenSource();
-        this.orderPollingCts = cts;
-        _ = Task.Run(() => this.PollOrdersAsync(client, cts.Token), cts.Token);
+        this.orderStreamCts = cts;
+        _ = Task.Run(() => this.StreamOrdersAsync(client, cts.Token), cts.Token);
     }
 
-    private void StopOrderPolling()
+    private void StopOrderStream()
     {
-        var cts = this.orderPollingCts;
-        this.orderPollingCts = null;
+        var cts = this.orderStreamCts;
+        this.orderStreamCts = null;
         if (cts == null)
             return;
 
@@ -237,16 +236,19 @@ internal sealed class SchwabTradingVendor : Vendor
         cts.Dispose();
     }
 
-    private async Task PollOrdersAsync(SchwabTradingBackendClient client, CancellationToken token)
+    private async Task StreamOrdersAsync(SchwabTradingBackendClient client, CancellationToken token)
     {
         while (!token.IsCancellationRequested)
         {
             try
             {
-                var orders = this.FilterVisibleOrders(await client.GetOrdersAsync(token).ConfigureAwait(false));
-                if (this.PublishOrderChanges(orders))
+                await foreach (var streamedOrders in client.StreamOrdersAsync(token).ConfigureAwait(false))
                 {
-                    await this.RefreshPositionsAsync(token).ConfigureAwait(false);
+                    var orders = this.FilterVisibleOrders(streamedOrders);
+                    if (this.PublishOrderChanges(orders))
+                    {
+                        await this.RefreshPositionsAsync(token).ConfigureAwait(false);
+                    }
                 }
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested)
@@ -255,12 +257,12 @@ internal sealed class SchwabTradingVendor : Vendor
             }
             catch
             {
-                // Keep the connector alive; the next poll will retry account/trading state.
+                // Keep the connector alive; the stream reconnect below will retry account/trading state.
             }
 
             try
             {
-                await Task.Delay(OrderPollingInterval, token).ConfigureAwait(false);
+                await Task.Delay(OrderStreamReconnectDelay, token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested)
             {
@@ -381,7 +383,6 @@ internal sealed class SchwabTradingVendor : Vendor
                     RequiresStopPrice(parameters.OrderTypeId) ? stopPrice : null,
                     shareQuantity,
                     ConvertTimeInForce(parameters.TimeInForce)));
-                this.RefreshOrdersInBackground();
             }
 
             return TradingOperationResult.CreateSuccess(parameters.RequestId, result?.OrderId);
@@ -440,7 +441,6 @@ internal sealed class SchwabTradingVendor : Vendor
                 RequiresStopPrice(parameters.OrderTypeId) ? stopPrice : null,
                 shareQuantity,
                 ConvertTimeInForce(parameters.TimeInForce));
-            this.RefreshOrdersInBackground();
 
             return TradingOperationResult.CreateSuccess(parameters.RequestId, replacementOrderId);
         }
@@ -462,7 +462,6 @@ internal sealed class SchwabTradingVendor : Vendor
                 .GetAwaiter()
                 .GetResult();
             this.PushMessage(new MessageCloseOrder { OrderId = parameters.Order.Id });
-            this.RefreshOrdersInBackground();
             return TradingOperationResult.CreateSuccess(parameters.RequestId, parameters.Order.Id);
         }
         catch (Exception ex)
@@ -759,37 +758,6 @@ internal sealed class SchwabTradingVendor : Vendor
     {
         lock (this.syncRoot)
             return this.orderCache.TryGetValue(orderId, out order!);
-    }
-
-    private void RefreshOrdersInBackground()
-    {
-        var client = this.backendClient;
-        if (client == null)
-            return;
-
-        var token = this.orderPollingCts?.Token ?? CancellationToken.None;
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                foreach (var delay in ActionRefreshScheduleMilliseconds)
-                {
-                    await Task.Delay(TimeSpan.FromMilliseconds(delay), token).ConfigureAwait(false);
-                    var orders = this.FilterVisibleOrders(await client.GetOrdersAsync(token).ConfigureAwait(false));
-                    if (this.PublishOrderChanges(orders))
-                    {
-                        await this.RefreshPositionsAsync(token).ConfigureAwait(false);
-                    }
-                }
-            }
-            catch (OperationCanceledException) when (token.IsCancellationRequested)
-            {
-            }
-            catch
-            {
-                // Background reconciliation must never block or fail the user-initiated order action.
-            }
-        }, token);
     }
 
     private async Task RefreshPositionsAsync(CancellationToken token)

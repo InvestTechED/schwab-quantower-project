@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
@@ -25,6 +27,7 @@ from schwab.orders.equities import (
     equity_sell_short_market,
 )
 from schwab.orders.generic import OrderBuilder
+from schwab.streaming import StreamClient
 from schwab.utils import Utils
 
 from app.models import BrokerAccount, BrokerExecution, BrokerOrder, BrokerPosition, BrokerTrade, EquityOrderRequest, ModifyEquityOrderRequest
@@ -304,13 +307,6 @@ class SchwabBrokerService:
             duration=_resolve_duration(request.time_in_force, None),
             session=_resolve_session_for_request(request.time_in_force),
         )
-        preview_response = client.preview_order(account_hash, order_spec)
-        preview_response.raise_for_status()
-        preview_payload = preview_response.json()
-        rejects = preview_payload.get("orderValidationResult", {}).get("rejects", [])
-        if rejects:
-            raise ValueError(f"Schwab preview rejected order: {rejects}")
-
         response = client.place_order(account_hash, order_spec)
         response.raise_for_status()
         order_id = Utils(client, account_hash).extract_order_id(response)
@@ -319,7 +315,7 @@ class SchwabBrokerService:
             "account_hash": account_hash,
             "order_id": str(order_id) if order_id is not None else None,
         }
-        self._audit("place", account_hash, request, {**result, "preview": preview_payload})
+        self._audit("place", account_hash, request, result)
         return result
 
     def modify_order(self, request: ModifyEquityOrderRequest) -> dict[str, object]:
@@ -349,9 +345,6 @@ class SchwabBrokerService:
     def cancel_order(self, account_hash: str, order_id: str) -> dict[str, object]:
         client = self.auth_service.create_client()
         resolved_hash = self._resolve_account_hash(client, account_hash)
-        active_order_ids = {order.order_id for order in self.get_orders() if order.account_hash == resolved_hash and _is_active_order_status(order.status)}
-        if str(order_id) not in active_order_ids:
-            raise ValueError(f"Order {order_id} is not active/cancelable in the current Schwab order set")
 
         response = client.cancel_order(order_id, resolved_hash)
         response.raise_for_status()
@@ -363,6 +356,63 @@ class SchwabBrokerService:
         }
         self._audit("cancel", resolved_hash, None, result)
         return result
+
+    async def stream_orders(self):
+        client = self.auth_service.create_client()
+        hash_to_number, _ = self._account_mappings(client)
+        account_numbers = [
+            account_number
+            for account_number in hash_to_number.values()
+            if not str(account_number).endswith("6462")
+        ]
+        if not account_numbers:
+            raise ValueError("No visible Schwab accounts are available for account activity streaming")
+
+        queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        stop_event = asyncio.Event()
+
+        async def emit_current_orders() -> str:
+            orders = await asyncio.to_thread(self.get_orders)
+            payload = [order.model_dump(mode="json") for order in orders]
+            return f"event: orders\ndata: {json.dumps(payload, default=str)}\n\n"
+
+        async def run_account_stream(account_number: str) -> None:
+            stream_client = StreamClient(self.auth_service.create_client(), account_id=int(account_number))
+
+            def on_account_activity(message):
+                queue.put_nowait({"account_number": account_number, "message": message})
+
+            stream_client.add_account_activity_handler(on_account_activity)
+            await stream_client.login()
+            await stream_client.account_activity_sub()
+            try:
+                while not stop_event.is_set():
+                    await stream_client.handle_message()
+            finally:
+                with contextlib.suppress(Exception):
+                    await stream_client.logout()
+
+        tasks = [asyncio.create_task(run_account_stream(str(account_number))) for account_number in account_numbers]
+
+        try:
+            yield await emit_current_orders()
+            while True:
+                done = [task for task in tasks if task.done()]
+                if done:
+                    done[0].result()
+
+                try:
+                    await asyncio.wait_for(queue.get(), timeout=20)
+                    yield await emit_current_orders()
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            stop_event.set()
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
 
     def _get_order_details(self, client, account_hash: str, order_id: str) -> dict:
         response = client.get_order(order_id, account_hash)

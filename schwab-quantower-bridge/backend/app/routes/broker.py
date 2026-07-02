@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 
 from app.models import EquityOrderRequest, ModifyEquityOrderRequest
 from app.services.broker import SchwabBrokerService
@@ -44,6 +45,18 @@ def broker_orders(
             lookback_days=lookback_days,
             from_entered_datetime=from_entered_datetime,
             to_entered_datetime=to_entered_datetime,
+        )
+    except Exception as exc:
+        _raise_broker_error(exc)
+
+
+@router.get("/broker/orders/stream")
+async def broker_orders_stream():
+    try:
+        return StreamingResponse(
+            broker_service.stream_orders(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"},
         )
     except Exception as exc:
         _raise_broker_error(exc)

@@ -1,4 +1,5 @@
 using System.Net.Http.Json;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using SchwabQuantowerBridge.Models;
@@ -58,6 +59,49 @@ public sealed class SchwabTradingBackendClient
             cancellationToken);
 
         return orders ?? [];
+    }
+
+    public async IAsyncEnumerable<IReadOnlyList<BrokerOrderDto>> StreamOrdersAsync(
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"{BackendBaseUrl}/api/broker/orders/stream");
+        using var response = await this.httpClient.SendAsync(
+            request,
+            HttpCompletionOption.ResponseHeadersRead,
+            cancellationToken);
+
+        await EnsureSuccessWithDetailAsync(response, cancellationToken);
+
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+        var data = new StringBuilder();
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var line = await reader.ReadLineAsync(cancellationToken);
+            if (line == null)
+                break;
+
+            if (line.Length == 0)
+            {
+                if (data.Length > 0)
+                {
+                    var json = data.ToString();
+                    data.Clear();
+                    var orders = JsonSerializer.Deserialize<List<BrokerOrderDto>>(json, JsonOptions);
+                    yield return orders ?? [];
+                }
+
+                continue;
+            }
+
+            if (line.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+            {
+                if (data.Length > 0)
+                    data.AppendLine();
+                data.Append(line[5..].TrimStart());
+            }
+        }
     }
 
     public async Task<BrokerOrderResultDto?> PlaceOrderAsync(
